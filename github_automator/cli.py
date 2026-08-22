@@ -30,7 +30,7 @@ from .analyzer import analyze
 from .docgen import write_readme
 from .github import create_release, create_repo, get_authenticated_user, has_commit, push
 from .han2py import han_to_repo_name
-from .packager import make_release_zip, write_gitignore
+from .packager import make_release_zip, write_gitignore, should_include, GitignoreMatcher
 
 VERSION = "0.1.0"
 
@@ -55,6 +55,26 @@ def _log(msg: str) -> None:
 def _git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=str(cwd),
                           capture_output=True, text=True, check=check)
+
+
+def _git_add_safe(project: Path) -> None:
+    """安全暂存：只 add 通过 should_include 过滤的文件，永不动 .workbuddy/ 等敏感目录。
+
+    替代 `git add -A`——后者会把历史已 tracked 的敏感文件（如 .workbuddy/ 本地记忆）
+    也推到公开仓库，且 .gitignore 对已 tracked 文件无效，曾导致隐私泄漏。
+    本函数复用打包快照同一套过滤逻辑，保证「仓库提交内容」与「Release zip 内容」一致，
+    并显式兜底排除 .git / .workbuddy / dist（dist 为发布资产，已单独上传，不进历史）。
+    """
+    root = Path(project).resolve()
+    gitignore = GitignoreMatcher(root)
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(root)
+        if ".git" in rel.parts or ".workbuddy" in rel.parts or "dist" in rel.parts:
+            continue
+        if should_include(p, root, gitignore=gitignore):
+            _git(["add", str(p)], cwd=project, check=False)
 
 
 def run(project: Path, repo: str, version: str, private: bool,
@@ -96,7 +116,7 @@ def run(project: Path, repo: str, version: str, private: bool,
     if not (project / ".git").exists():
         _git(["init"], cwd=project)
         _git(["checkout", "-b", "main"], cwd=project, check=False)
-    _git(["add", "-A"], cwd=project)
+    _git_add_safe(project)  # 安全暂存：永不包括 .workbuddy 等敏感目录
     # 若无可提交内容则跳过提交
     status = _git(["status", "--porcelain"], cwd=project, check=False)
     if status.stdout.strip():
