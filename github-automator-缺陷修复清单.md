@@ -156,6 +156,41 @@ def create_release(...):
 | 1 | 缺陷 1（行内注释） | ✅ 已修复（`GitignoreMatcher._strip_inline_comment`） |
 | 2 | 缺陷 2（.gitignore 保留） | ✅ 已修复（`should_include` 顺序调整 + `analyzer.py` 同步） |
 | 3 | 缺陷 3（create_release 幂等） | ✅ 已修复（`_gh_release_view` / `_gh_upload_asset` / token 路径查重） |
+| 4 | 缺陷 4（`git add -A` 误推敏感目录） | ✅ 已修复（`_git_add_safe` 替代 `git add -A`） |
+
+## 缺陷 4：`git add -A` 可能把敏感目录推到公开仓库（隐私隐患）
+
+| 项 | 内容 |
+|---|---|
+| 严重度 | 高（隐私泄漏，曾在 v1.2.0 真实发生） |
+| 位置 | `github_automator/cli.py` `run()` 第 99 行（原 `git add -A`） |
+| 现象 | 工具自举发布时用 `git add -A` 暂存全部文件。若项目历史中 `.workbuddy/`（本地助手记忆/元数据）**已被 tracked**，`.gitignore` 对它无效（gitignore 只作用于未跟踪文件），会被一并提交并推到公开 GitHub 仓库。 |
+| 影响 | 2026-08-23 发布 v1.2.0 时，`.workbuddy/memory/*.md` 被推到公开仓库（`223jxy/github-automator`），违反隐私红线（本地助手元数据不公开）。事后靠 `git rm --cached` + 删 tag 重建 Release 补救。 |
+| 本次修复 | 新增 `_git_add_safe(project)`：遍历项目文件，仅 `git add` 通过 `should_include` 过滤的文件，并**显式兜底排除** `.git` / `.workbuddy` / `dist` 目录（dist 为发布资产已单独上传，不进历史）。替代 `git add -A`。 |
+
+### 修复方案
+```python
+def _git_add_safe(project: Path) -> None:
+    root = Path(project).resolve()
+    gitignore = GitignoreMatcher(root)
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(root)
+        if ".git" in rel.parts or ".workbuddy" in rel.parts or "dist" in rel.parts:
+            continue
+        if should_include(p, root, gitignore=gitignore):
+            _git(["add", str(p)], cwd=project, check=False)
+```
+- 复用打包快照同一套过滤逻辑（`should_include` + `GitignoreMatcher`），保证「仓库提交内容」与「Release zip 内容」一致。
+- 即使 `should_include` 有疏漏，`.workbuddy` 兜底仍生效——双保险。
+
+### 验收标准
+- 新增单测 `TestGitAddSafe`：
+  - `test_never_adds_workbuddy`：构造含 `.workbuddy/memory.md`（模拟历史 tracked）和 `dist/x.zip` 的项目，mock `_git` 捕获 add 调用，断言二者绝不被加、源码 `main.py` 被加。
+  - `test_adds_source_respecting_gitignore`：自定义 `.gitignore` 排除 `secret.txt`，断言其不被加。
+- 回归：现有 46 测试 + 该 2 项 = **48 测试全绿**（`unittest discover` Ran 48 tests OK）。
+- 真实验证（可选）：在任意项目跑工具，核查远程根目录不含 `.workbuddy/`。
 
 ## 附加改造：仓名汉转英 + 零交互（用户 2026-08-23 需求）
 

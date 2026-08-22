@@ -111,3 +111,27 @@ grep -c "__pycache__\|\*.pyc" .gitignore   # 命中，Python 片段已补全
 - dry-run 端到端：目录「自动点击脚本」不传 `--repo` → 推断仓名 `zi-dong-dian-ji-jiao-ben`，无交互提示。
 
 > 设计原则保持：纯标准库（运行时）、token 不落盘、轻量可落地。仅新增一份 vendored 静态数据 `_han2py.json`（~93KB），不引入任何运行时第三方依赖。
+
+---
+
+## 七、Phase 6 — 修复 `git add -A` 隐私隐患（2026-08-23）
+
+发布 v1.2.0 时暴露：工具自举用 `git add -A` 暂存全部文件，导致历史已 tracked 的 `.workbuddy/`（本地助手记忆）被推到公开仓库 `223jxy/github-automator`，违反隐私红线。事后靠 `git rm --cached` + 删 tag 重建 Release 补救。本次从工具层面根除。
+
+### 改动
+| 项 | 位置 | 说明 |
+|----|------|------|
+| 新增 `_git_add_safe(project)` | `cli.py` | 遍历项目文件，仅 `git add` 通过 `should_include` 过滤的文件，并**显式兜底排除** `.git` / `.workbuddy` / `dist`（dist 为发布资产已单独上传，不进历史）。替代原 `git add -A`。 |
+| 调用点替换 | `cli.py` `run()` | `git add -A` → `_git_add_safe(project)` |
+| 测试 | `test_cli.py` | 新增 `TestGitAddSafe`：`test_never_adds_workbuddy`（mock 捕获 add，断言 `.workbuddy`/`dist` 绝不被加）、`test_adds_source_respecting_gitignore`（自定义 .gitignore 仍生效） |
+
+### 附带收益
+- 仓库提交内容与 Release zip 内容用同一套过滤逻辑，二者保持一致。
+- 即使 `should_include` 有疏漏，`.workbuddy` 兜底仍生效，双保险。
+
+### 验证
+- `python -m unittest discover -s tests` → **Ran 48 tests ... OK**（原 46 + 新增 2）。
+- 提交 `13218e4`（仅本地，未 push / 未重发——本次任务仅修隐患）。
+- 真实验证（可选）：在任意项目跑工具，核查远程根目录不含 `.workbuddy/`。
+
+> 设计原则保持：纯标准库、token 不落盘、轻量可落地。

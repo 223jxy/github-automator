@@ -49,9 +49,10 @@ python cli.py . --repo secret --private --token ghp_xxx
 | `packager.py` | 生成 `.gitignore` + 打干净 zip | 按识别到的生态拼 `.gitignore` 片段；zip 排除忽略目录与大文件 |
 | `docgen.py` | 生成 `README.md` | 用 HTML 注释作隐形标记，让分析器能识别"自生成"并避免回环 |
 | `github.py` | 建仓库 / 推送 / 建 Release | 认证优先级：`gh` CLI → REST API（token 来自参数或 `GITHUB_TOKEN`） |
-| `cli.py` | 参数解析 + 6 步编排 | `argparse`，支持 `--dry-run` / `--private` / `--token` / `--no-release` / `--force-readme` / `--refresh-gitignore` |
+| `cli.py` | 参数解析 + 6 步编排 | `argparse`，支持 `--dry-run` / `--private` / `--token` / `--no-release` / `--force-readme` / `--refresh-gitignore`；缺省仓名=目录名汉转英，全链路零交互 |
+| `han2py.py` | 目录名「汉转英」 | 汉字逐音节转小写拼音并以 `-` 分隔；数据依赖 vendored `_han2py.json`（GB2312 6763 字，零运行时依赖） |
 | `cli.py`（根） | 薄入口，等价 `python -m github_automator.cli` | 仅做 `sys.path` 注入后转发 `main()` |
-| `tests/` | 单元测试 | 覆盖 `analyzer` / `packager` / `docgen` / `cli` / `github` 共 31 个用例 |
+| `tests/` | 单元测试 | 覆盖 `analyzer` / `packager` / `docgen` / `cli` / `github` / `han2py` 共 48 个用例 |
 
 **数据流**：`analyze()` → `ProjectInfo` →（打包 / 文档 / 推送）全程以同一个 `ProjectInfo` 为载体，模块间解耦清晰。
 
@@ -76,4 +77,6 @@ cli.run(project)
 4. **自识别标记防回环**（巧妙）：生成的 README 含 `<!-- 本 README 由 github-automator 自动生成 -->`，分析器读到这个标记就不把它当"真实项目简介"复用——避免了"用自生成 README 再生成 README"的死循环。
 5. **认证优先级合理**：优先 `gh`（token 不落盘），回退 API。
 6. **跨平台**：全程 `pathlib`，无硬编码路径分隔符。
-7. **测试通过且能自举**：20 个单测全绿，工具对自身可端到端跑通。
+7. **测试通过且能自举**：48 个单测全绿，工具对自身可端到端跑通（含 dry-run 零写入、缺陷回归测试）。
+8. **发布安全**：提交用 `_git_add_safe` 显式过滤，永不包括 `.workbuddy/` 等本地元数据（隐私红线）；Release 创建幂等（查重+续传资产），不因数次中断而崩。
+9. **零交互 + 汉转英仓名**：给路径即全链路跑完；未指定 `--repo` 时仓库名自动从目录名转拼音 slug，无需人工干预。
