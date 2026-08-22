@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "github-automator"
+version = "0.1.0"
+description = "把任意项目提炼、打包并自动化提交到 GitHub 的命令行工具（纯标准库，零依赖）"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+github-automator = "github_automator.cli:main"

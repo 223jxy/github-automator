@@ -1,0 +1,32 @@
+# 由 github-automator 自动生成
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+build/
+dist/
+
+# ===== 编辑器 / OS =====
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+# ===== 环境变量 / 密钥（务必保留，防止泄露） =====
+.env
+.env.*
+*.key
+*.pem
+secrets.json
+credentials.json
+# ===== 日志 / 临时 =====
+*.log
+tmp/
+temp/
