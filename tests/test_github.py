@@ -9,7 +9,7 @@ from unittest import mock
 
 from github_automator.github import (
     build_push_url, has_commit, _git_check, create_repo, push, _check_git_credentials,
-    _CREDENTIAL_ERROR_HINTS,
+    _CREDENTIAL_ERROR_HINTS, create_release, _gh_release_view, _gh_upload_asset,
 )
 
 
@@ -204,6 +204,81 @@ class TestPush(unittest.TestCase):
             self.assertIn("setup-git", str(ctx.exception))
             # 关键词确实命中 _CREDENTIAL_ERROR_HINTS
             self.assertTrue(any(h in "could not read username" for h in _CREDENTIAL_ERROR_HINTS))
+
+
+class _FakePath:
+    """模拟 Path，供 asset_path 参数使用。"""
+    def __init__(self, name="app-v1.0.0.zip", exists=True):
+        self.name = name
+        self._exists = exists
+    def exists(self):
+        return self._exists
+
+
+class TestCreateRelease(unittest.TestCase):
+    """create_release 幂等（缺陷3修复）：查重跳过 / already-exists 续传 / 真错误仍抛。"""
+
+    def test_gh_release_exists_skips_create(self):
+        # 已存在且资产齐 -> 不调 create，返回现有 url（仅允许 release view 查重）
+        view = _FakeCompleted(returncode=0,
+                              stdout="https://github.com/o/r/releases/tag/v1.0.0\napp-v1.0.0.zip\n")
+        with mock.patch("github_automator.github.detect_gh", return_value=True), \
+             mock.patch("github_automator.github._run", return_value=view) as run:
+            url = create_release("o", "r", "v1.0.0", "r v1.0.0", "notes",
+                                 asset_path=_FakePath())
+            self.assertEqual(url, "https://github.com/o/r/releases/tag/v1.0.0")
+            # 绝不应出现 `gh release create` 调用
+            create_calls = [c for c in run.call_args_list
+                            if c.args[0][:3] == ["gh", "release", "create"]]
+            self.assertEqual(len(create_calls), 0)
+
+    def test_gh_release_exists_missing_asset_uploads(self):
+        # 已存在但资产缺失 -> 续传资产后返回，不调 create
+        view = _FakeCompleted(returncode=0,
+                              stdout="https://github.com/o/r/releases/tag/v1.0.0\nother.txt\n")
+        uploaded = []
+        def fake_run(cmd, cwd=None, check=True):
+            if cmd[:3] == ["gh", "release", "upload"]:
+                uploaded.append(cmd)
+                return _FakeCompleted(returncode=0)
+            return view
+        with mock.patch("github_automator.github.detect_gh", return_value=True), \
+             mock.patch("github_automator.github._run", side_effect=fake_run):
+            url = create_release("o", "r", "v1.0.0", "r v1.0.0", "notes",
+                                 asset_path=_FakePath())
+            self.assertEqual(url, "https://github.com/o/r/releases/tag/v1.0.0")
+            self.assertEqual(len(uploaded), 1)
+
+    def test_gh_release_already_exists_recovers(self):
+        # create 报 already-exists -> 查重后续传资产返回，不抛
+        create_fail = _FakeCompleted(returncode=1,
+                                     stderr="a release with the same tag name already exists: v1.0.0")
+        view = _FakeCompleted(returncode=0,
+                              stdout="https://github.com/o/r/releases/tag/v1.0.0\nother.txt\n")
+        uploaded = []
+        def fake_run(cmd, cwd=None, check=True):
+            if cmd[:3] == ["gh", "release", "upload"]:
+                uploaded.append(cmd)
+                return _FakeCompleted(returncode=0)
+            if cmd[:3] == ["gh", "release", "create"]:
+                return create_fail
+            return view  # release view 等
+        with mock.patch("github_automator.github.detect_gh", return_value=True), \
+             mock.patch("github_automator.github._run", side_effect=fake_run):
+            url = create_release("o", "r", "v1.0.0", "r v1.0.0", "notes",
+                                 asset_path=_FakePath())
+            self.assertEqual(url, "https://github.com/o/r/releases/tag/v1.0.0")
+            self.assertEqual(len(uploaded), 1)
+
+    def test_gh_release_real_error_still_raises(self):
+        # 非 already-exists 错误（如网络/权限）-> 仍抛
+        create_fail = _FakeCompleted(returncode=1,
+                                     stderr="HTTP 422: Repository not found")
+        with mock.patch("github_automator.github.detect_gh", return_value=True), \
+             mock.patch("github_automator.github._run", return_value=create_fail):
+            with self.assertRaises(RuntimeError):
+                create_release("o", "r", "v1.0.0", "r v1.0.0", "notes",
+                               asset_path=_FakePath())
 
 
 if __name__ == "__main__":

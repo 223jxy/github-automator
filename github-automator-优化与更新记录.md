@@ -83,3 +83,31 @@ grep -c "__pycache__\|\*.pyc" .gitignore   # 命中，Python 片段已补全
 **当前测试总数**：31（原 22 + 新增 9）。`python -m unittest discover -s tests` → **Ran 31 tests ... OK**。
 
 > 设计原则保持：纯标准库、token 不落盘、轻量可落地。Phase 4 未引入任何第三方依赖。
+
+---
+
+## 六、Phase 5 — 缺陷修复 + 仓名汉转英 + 零交互（2026-08-23）
+
+基于第三方项目「自动点击脚本」真实发布（`sevenday-automation` v1.0.0，见 issue #1）暴露的 3 个工具自身缺陷，全部修复，并按需求改造仓名推断与交互模式。
+
+### 缺陷修复
+
+| # | 缺陷 | 严重度 | 改动位置 | 验证 |
+|---|------|--------|----------|------|
+| 1 | `GitignoreMatcher` 不支持行内 `#` 注释（排除规则静默失效） | 中 | `packager.py` `GitignoreMatcher` 新增 `_strip_inline_comment()`（保护引号内 `#`），解析前剥离行内注释 | `test_gitignore_matcher_inline_comment` / `..._does_not_break_negation` |
+| 2 | `should_include` 无条件保留所有 `.gitignore`（被忽略目录内嵌套 .gitignore 泄漏） | 中 | `packager.py` `should_include` 调整顺序：先判自定义 `.gitignore` 命中，再决定是否保留根 `.gitignore`；`analyzer.py:277` 同步 | `test_nested_gitignore_in_ignored_dir_excluded` / `test_root_gitignore_still_included` / `test_one_level_nested_gitignore_outside_ignored_kept` |
+| 3 | `create_release` 不幂等（撞 already-exists 直接抛、中断资产上传） | 高 | `github.py` 新增 `_gh_release_view()` / `_gh_upload_asset()`；gh 与 token 路径均加 Release/Tag 查重，已存在则跳过或续传资产，非 already-exists 错误仍抛 | `TestCreateRelease`（exists_skips / exists_missing_asset_uploads / already_exists_recovers / real_error_still_raises） |
+
+### 仓名汉转英 + 零交互改造
+
+- 新增 `github_automator/han2py.py` + vendored 数据 `github_automator/_han2py.json`（GB2312 6763 字拼音映射，由 pypinyin 预生成，**随包发布、运行时零第三方依赖**）。
+- `han_to_repo_name(dirname)`：汉字逐音节转小写拼音并以 `-` 分隔，ASCII 段保留，其它归一为 `-`；无可用字符回退 `github-automator`。
+  - 例：`自动点击脚本` → `zi-dong-dian-ji-jiao-ben`；`My 项目 v2` → `my-xiang-mu-v2`。
+- `cli.py`：缺省仓名从「包名 `github-automator`」改为 `_default_repo_name(project)`（目录名汉转英）；删除「未指定 --repo」提示打印，**全链路零交互**（给路径即跑到底）。`--repo` 显式指定仍优先。
+- 限制（已写入缺陷清单）：自动转写为**音节级拼音**，无法语义翻译；极生僻/繁体字可能不在映射表，触发回退名。
+
+### 验证
+- `python -m unittest discover -s tests` → **Ran 46 tests ... OK**（原 31 + 新增 15）。
+- dry-run 端到端：目录「自动点击脚本」不传 `--repo` → 推断仓名 `zi-dong-dian-ji-jiao-ben`，无交互提示。
+
+> 设计原则保持：纯标准库（运行时）、token 不落盘、轻量可落地。仅新增一份 vendored 静态数据 `_han2py.json`（~93KB），不引入任何运行时第三方依赖。

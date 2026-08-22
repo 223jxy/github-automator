@@ -121,6 +121,66 @@ class TestPackager(unittest.TestCase):
             self.assertFalse(m.ignored("keep.tmp"))  # 否定规则重新包含
             self.assertFalse(m.ignored("main.py"))
 
+    def test_gitignore_matcher_inline_comment(self):
+        # 缺陷1修复：行内 # 注释应被剥离，否则 `outputs/    # 注释` 会被当成 glob 模式
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "p"
+            root.mkdir()
+            (root / ".gitignore").write_text(
+                "outputs/    # 运行产物（截图/识别结果），每次运行重新生成\n"
+                "work/    # 本机工作目录\n")
+            m = GitignoreMatcher(root)
+            self.assertTrue(m.ignored("outputs/screenshot.png"))
+            self.assertTrue(m.ignored("sub/work/tmp.txt"))
+            self.assertFalse(m.ignored("src/main.py"))  # 注释文本不应成为模式
+
+    def test_gitignore_matcher_inline_comment_does_not_break_negation(self):
+        # 行内注释剥离不应破坏否定规则
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "p"
+            root.mkdir()
+            (root / ".gitignore").write_text("*.tmp    # 临时\n!keep.tmp\n")
+            m = GitignoreMatcher(root)
+            self.assertTrue(m.ignored("a.tmp"))
+            self.assertFalse(m.ignored("keep.tmp"))
+
+
+class TestShouldIncludeNestedGitignore(unittest.TestCase):
+    def test_nested_gitignore_in_ignored_dir_excluded(self):
+        # 缺陷2修复：被忽略目录内的嵌套 .gitignore 不应泄漏进 zip
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "p"
+            root.mkdir()
+            (root / ".gitignore").write_text("outputs/\n")
+            (root / "outputs").mkdir()
+            (root / "outputs" / ".gitignore").write_text("# nested placeholder\n")
+            (root / "outputs" / "screenshot.png").write_text("img")
+            (root / "main.py").write_text("print(1)\n")
+            gi = GitignoreMatcher(root)
+            self.assertFalse(should_include(root / "outputs" / ".gitignore", root, gitignore=gi))
+            self.assertFalse(should_include(root / "outputs" / "screenshot.png", root, gitignore=gi))
+            self.assertTrue(should_include(root / "main.py", root, gitignore=gi))
+
+    def test_root_gitignore_still_included(self):
+        # 根 .gitignore 仍可保留（供下游 unpack 复用忽略规则）
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "p"
+            root.mkdir()
+            (root / ".gitignore").write_text("outputs/\n")
+            gi = GitignoreMatcher(root)
+            self.assertTrue(should_include(root / ".gitignore", root, gitignore=gi))
+
+    def test_one_level_nested_gitignore_outside_ignored_kept(self):
+        # 非忽略目录下的一级嵌套 .gitignore 仍保留（保守：仅排除被忽略目录内）
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "p"
+            root.mkdir()
+            (root / ".gitignore").write_text("outputs/\n")
+            (root / "config").mkdir()
+            (root / "config" / ".gitignore").write_text("# local\n")
+            gi = GitignoreMatcher(root)
+            self.assertTrue(should_include(root / "config" / ".gitignore", root, gitignore=gi))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,7 +5,7 @@
     # 默认把当前目录提炼打包，新建公开仓库并推送 + 打 Release
     python cli.py .
 
-    # 指定项目路径、仓库名、版本
+    # 指定项目路径、仓库名、版本（未指定 --repo 时，仓库名=目录名汉转英）
     python cli.py /path/to/project --repo my-tool --version v1.0.0
 
     # 仅演示，不真正推送（dry-run）
@@ -29,13 +29,23 @@ from pathlib import Path
 from .analyzer import analyze
 from .docgen import write_readme
 from .github import create_release, create_repo, get_authenticated_user, has_commit, push
+from .han2py import han_to_repo_name
 from .packager import make_release_zip, write_gitignore
 
 VERSION = "0.1.0"
 
-# 缺省仓库名：当用户未用 --repo 指定时，回退到包名（ASCII 安全，避免中文目录名当仓名）。
-# 详见规范手册「容错契约」节。
+# 缺省仓库名回退值：当目录名经「汉转英」后无任何可用字符时使用（极少见）。
+# 详见规范手册「容错契约」节。正常情况缺省仓名 = 目录名的拼音 slug（见 _default_repo_name）。
 DEFAULT_REPO_NAME = "github-automator"
+
+
+def _default_repo_name(project: Path) -> str:
+    """缺省仓库名：目录名「汉转英」（零依赖，见 han2py）。
+
+    例：目录「自动点击脚本」-> "zi-dong-dian-ji-jiao-ben"；
+    目录「my-project」-> "my-project"（原样小写 slug）。
+    """
+    return han_to_repo_name(project.resolve().name)
 
 
 def _log(msg: str) -> None:
@@ -132,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         description="把任意项目提炼、打包并自动化提交到 GitHub（含 Release 压缩包）。",
     )
     parser.add_argument("project", nargs="?", default=".", help="项目目录（默认当前目录）")
-    parser.add_argument("--repo", default=None, help="GitHub 仓库名（默认用包名 github-automator）")
+    parser.add_argument("--repo", default=None, help="GitHub 仓库名（缺省=目录名汉转英，如「自动点击脚本」→ zi-dong-dian-ji-jiao-ben）")
     parser.add_argument("--version", default="v1.0.0", help="Release 标签（默认 v1.0.0）")
     parser.add_argument("--private", action="store_true", help="创建私有仓库（默认公开）")
     parser.add_argument("--token", default=None, help="GitHub token（无 gh 时使用；也可设环境变量 GITHUB_TOKEN）")
@@ -145,10 +155,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version-tool", action="version", version=f"github-automator {VERSION}")
     args = parser.parse_args(argv)
 
-    repo = args.repo or DEFAULT_REPO_NAME
-    if not args.repo:
-        # 未指定 --repo：回退到包名默认仓名，显式提示用户，避免静默用目录名（可能含中文）
-        print(f"[github-automator] 未指定 --repo，使用默认仓库名：{repo}")
+    # 零交互：未指定 --repo 时自动用「目录名汉转英」作缺省仓名，不再询问用户。
+    repo = args.repo or _default_repo_name(Path(args.project))
     return run(
         project=args.project,
         repo=repo,

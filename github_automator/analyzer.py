@@ -273,8 +273,9 @@ def build_tree(root: Path, max_depth: int = 3, max_entries: int = 60) -> str:
         entries = []
         for p in sorted(d.iterdir()):
             if p.name in DEFAULT_IGNORE_DIRS or p.name.startswith("."):
-                # .git 等隐藏目录略过；但保留部分有意义的点文件(.gitignore/.env 不保留)
-                if p.name in (".gitignore",):
+                # .git 等隐藏目录略过；但保留根目录 .gitignore（供复用忽略规则）
+                # 缺陷2修复：与 packager 保持一致，仅根 .gitignore 保留
+                if p.name == ".gitignore" and p.parent == root:
                     entries.append(p)
                 continue
             entries.append(p)

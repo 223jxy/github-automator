@@ -119,6 +119,23 @@ class GitignoreMatcher:
     *.log 等），而非仅依赖工具内置的 DEFAULT_IGNORE_DIRS。
     """
 
+    @staticmethod
+    def _strip_inline_comment(line: str) -> str:
+        """剥离行内 # 注释（缺陷1修复）。
+
+        .gitignore 仅允许注释独占一行或以 # 开头；行内 # 在标准里不是注释，
+        但真实项目常写成 `outputs/    # 运行产物` 这类行——若不当注释处理，
+        会把 `    # 运行产物` 当成 glob 模式，导致排除项静默失效。
+        为兼容这种写法，遇到第一个未加引号的 # 即截断（保护引号内 #，虽罕见但严谨）。
+        """
+        in_quote = False
+        for i, ch in enumerate(line):
+            if ch in ("'", '"'):
+                in_quote = not in_quote
+            elif ch == "#" and not in_quote:
+                return line[:i].rstrip()
+        return line.rstrip()
+
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
         self.rules: list[tuple[re.Pattern, bool]] = []  # (compiled_regex, is_negation)
@@ -126,7 +143,7 @@ class GitignoreMatcher:
         if not gif.is_file():
             return
         for raw in gif.read_text(encoding="utf-8", errors="ignore").splitlines():
-            line = raw.rstrip()
+            line = self._strip_inline_comment(raw.rstrip())
             if not line or line.lstrip().startswith("#"):
                 continue
             neg = line.startswith("!")
@@ -186,8 +203,6 @@ def should_include(path: Path, root: Path, gitignore: GitignoreMatcher | None = 
     rel = path.relative_to(root)
     if any(part in DEFAULT_IGNORE_DIRS for part in rel.parts):
         return False
-    if path.name in (".gitignore",) or path.name.endswith(".gitignore"):
-        return True
     name = path.name
     if name.startswith("."):
         # 密钥 / 凭据类点文件一律排除
@@ -196,8 +211,14 @@ def should_include(path: Path, root: Path, gitignore: GitignoreMatcher | None = 
         ):
             return False
         # 其他点文件（如 .editorconfig）保留
+    # 先应用项目自定义 .gitignore（优先级高于「保留 .gitignore」特殊规则，
+    # 缺陷2修复：避免被忽略目录内的嵌套 .gitignore 泄漏进 zip）
     if gitignore is not None and gitignore.ignored(rel.as_posix()):
         return False
+    # 仅当位于「根目录或非忽略目录」时保留 .gitignore（供下游 unpack 复用忽略规则）；
+    # 被忽略目录内的嵌套 .gitignore 已随目录一起在上方排除。
+    if name == ".gitignore" and len(rel.parts) <= 1:
+        return True
     try:
         if path.stat().st_size > 10_000_000:  # 10MB 以上视为大文件
             return False

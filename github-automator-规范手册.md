@@ -146,16 +146,19 @@ github自动化/
 工具发布时围绕"仓库名"有两类边界场景，行为必须可预测、不产生副作用。
 
 ### 5.1 未指定 `--repo`（缺省）
-- 不裸用项目目录名（可能为中文，URL 不友好），**回退到包名常量 `github-automator`**（ASCII 安全、可预测）。
-- 日志显式打印：`未指定 --repo，使用默认仓库名：github-automator`，让用户知情而非静默。
-- 实现位置：`cli.py` 的 `DEFAULT_REPO_NAME` 与 `main()` 的回退分支。
+- **零交互**：给路径即全链路跑到底，不询问、不打印「使用默认仓库名」提示。
+- 缺省仓名 = **目录名「汉转英」**：`cli.py` 的 `_default_repo_name(project)` 调用 `han2py.han_to_repo_name()`，把目录名转成 ASCII slug（汉字逐音节转小写拼音并以 `-` 分隔，ASCII 段保留，其它归一为 `-`）。
+  - 例：`自动点击脚本` → `zi-dong-dian-ji-jiao-ben`；`My 项目 v2` → `my-xiang-mu-v2`。
+- 仅当目录名经转写后无任何可用字符时，回退到常量 `DEFAULT_REPO_NAME = "github-automator"`。
+- 实现位置：`cli.py` 的 `_default_repo_name()` / `DEFAULT_REPO_NAME`；数据依赖 `github_automator/_han2py.json`（GB2312 6763 字拼音映射，vendored，运行时零第三方依赖）。
+- 限制：转写为**音节级拼音**，无法语义翻译；语义化英文名仍需显式 `--repo` 指定。
 
 ### 5.2 仓库已存在 / 冲突
 按"是否属于你"区分，绝不自动改名重试（避免产生 `xxx-1`/`xxx-2` 垃圾仓库）：
 
 | 子场景 | 行为 |
 |--------|------|
-| 无 `--repo` | 用默认名 `github-automator`，日志提示 |
+| 无 `--repo` | 自动用目录名汉转英 slug（如 `自动点击脚本`→`zi-dong-dian-ji-jiao-ben`），零交互 |
 | `--repo` 不存在 | 正常新建（现有行为） |
 | `--repo` 已存在且属于你（空/非空仓） | 复用，继续推送 / Release |
 | `--repo` 已存在但不属于你 / 无权限 / 名字非法 | **显式抛 `RuntimeError`**，信息含仓库名 + 建议（`换名（--repo）或确认权限`），不静默、不重试、不自动改名 |
