@@ -192,6 +192,70 @@ def _git_add_safe(project: Path) -> None:
 - 回归：现有 46 测试 + 该 2 项 = **48 测试全绿**（`unittest discover` Ran 48 tests OK）。
 - 真实验证（可选）：在任意项目跑工具，核查远程根目录不含 `.workbuddy/`。
 
+## 缺陷 5：发布直接 `git init` 源项目，污染用户项目（误 git 化 + 残留 dist）
+
+| 项 | 内容 |
+|---|---|
+| 严重度 | 高（污染用户工作区，且暴露工具内部行为） |
+| 位置 | `github_automator/cli.py` `run()` 原第 106–125 行（`git init` / `commit` 直接作用于 `project` 源目录） |
+| 现象 | 工具在**源项目目录**就地 `git init`、提交、生成 `dist/<repo>-<version>.zip`。若用户项目本不是 git 仓库（如 `网盘整理工具/netdisk-organizer`），会被强制 git 化；且源项目残留 `dist/`（工具产物）。 |
+| 影响 | 真实发布 `netdisk-organizer` 时，源项目被建了 `.git`（首次运行的 commit 还因 gh 未认证失败，留下半截 git 状态）；用户工作区被污染，违背"工具只读取源项目"的假设。 |
+| 本次修复 | 发布的所有 git 操作与 zip 生成**全部迁移到临时目录**（`tempfile.TemporaryDirectory`）：过滤后复制源码到 `stage`，在 `stage` 内 `init/add/commit/push`；zip 生成到临时目录顶层（不进 `stage` 的 git 历史）。源项目**全程只读**，不产生 `.git`/`dist`、不被写回。 |
+
+### 修复方案（核心改动 `run()` 第 113–167 行）
+```python
+with tempfile.TemporaryDirectory(prefix="gh-auto-") as tmp:
+    tmp = Path(tmp)
+    stage = tmp / repo                      # 临时发布目录
+    stage.mkdir(parents=True, exist_ok=True)
+    # 1) 过滤后复制源码到 stage（源项目只读）
+    for p in sorted(project.rglob("*")):
+        ...
+        if should_include(p, project, gitignore=gitignore):
+            shutil.copy2(p, stage / rel)
+    # 2) 仅当源项目缺失时才把生成内容写入 stage（不污染源项目）
+    if gi_text is not None: (stage/".gitignore").write_text(gi_text, ...)
+    if readme_text is not None: (stage/"README.md").write_text(readme_text, ...)
+    # 3) git 操作仅作用于 stage
+    _git(["init"], cwd=stage); _git(["add","-A"], cwd=stage); ...
+    # 4) zip 生成到 tmp 顶层（不进 stage 的 git 历史）
+    zip_path = make_release_zip(stage, info, version, tmp, archive_name=repo)
+    push(stage, ...); create_release(..., cwd=stage)
+```
+
+### 验收标准
+- 新增单测 `TestRunDoesNotPolluteSource`：
+  - `test_source_project_untouched_no_git_no_dist_added`：源项目发布后无 `.git`、文件集合不变。
+  - `test_source_with_only_untracked_dist_does_not_crash`：源项目仅含未跟踪 `dist` 时正常完成（rc=0）且不崩溃。
+- 真实验证：`netdisk-organizer` 发布后 `ls` 源项目确认无 `.git`、无 `dist`（✅ 已验证）。
+
+## 缺陷 6：`create_release` 的 `gh` 路径未传 `cwd`，Release 误打到工具自身仓库
+
+| 项 | 内容 |
+|---|---|
+| 严重度 | 中（Release 发错仓库，需手动纠错） |
+| 位置 | `github_automator/github.py` `create_release` / `_gh_release_view` / `_gh_upload_asset`（gh 路径未带 `cwd`） |
+| 现象 | `gh release create` 默认作用于「进程当前工作目录」的 git remote，而工具进程 cwd 是 `github-automator` 工作区。导致 `netdisk-organizer` 发布时，Release 被误打到 `github-automator` 仓库（仅因它已有同名 tag 被幂等复用，未新建，但 URL 错误）。 |
+| 影响 | 目标仓库 `netdisk-organizer` 缺 Release；工具日志显示错误仓库 URL，误导排查。 |
+| 本次修复 | 给 `create_release` / `_gh_release_view` / `_gh_upload_asset` 增加 `cwd` 参数；`cli.run` 调用时传入 `cwd=stage`（临时发布目录，remote 指向目标仓库）。gh 作用到正确仓库。 |
+
+### 验收标准
+- 单测 `test_source_project_untouched_...` 已断言 `create_release` 被传入 `cwd` 且 `cwd != Path.cwd()`、`repo == "myproj"`（目标仓库名正确）。
+- 真实验证：`netdisk-organizer` 已正确创建 v1.0.0 Release 于自身仓库（✅ `https://github.com/223jxy/netdisk-organizer/releases/tag/v1.0.0`）。
+
+## 执行顺序建议
+
+| 次序 | 缺陷 | 状态 |
+|---|---|---|
+| 1 | 缺陷 1（行内注释） | ✅ 已修复（`GitignoreMatcher._strip_inline_comment`） |
+| 2 | 缺陷 2（.gitignore 保留） | ✅ 已修复（`should_include` 顺序调整 + `analyzer.py` 同步） |
+| 3 | 缺陷 3（create_release 幂等） | ✅ 已修复（`_gh_release_view` / `_gh_upload_asset` / token 路径查重） |
+| 4 | 缺陷 4（`git add -A` 误推敏感目录） | ✅ 已修复（`_git_add_safe` 替代 `git add -A`，Phase 6） |
+| 5 | 缺陷 5（git init 污染源项目） | ✅ 已修复（临时目录发布，Phase 7） |
+| 6 | 缺陷 6（Release 误打仓库） | ✅ 已修复（`create_release` 传 `cwd=stage`，Phase 7） |
+
+> 测试总数：31（初版）→ 46（Phase 5）→ 48（Phase 6）→ **50**（Phase 7，新增 `TestRunDoesNotPolluteSource` 2 项）。
+
 ## 附加改造：仓名汉转英 + 零交互（用户 2026-08-23 需求）
 
 用户要求：直接给路径即自动打包上传，不在对话里询问；未指定 `--repo` 时仓库名「汉转英」。

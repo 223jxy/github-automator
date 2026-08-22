@@ -266,11 +266,15 @@ def push(root: Path, clone_url: str, token: Optional[str] = None,
     _git_check(["git", "-C", str(root), "branch", "--set-upstream-to", f"origin/{branch}"], root, "设置 upstream")
 
 
-def _gh_release_view(tag: str) -> Optional[dict]:
-    """查 release 是否存在（gh 路径）。存在返回 dict(url, assets[])，否则 None。"""
+def _gh_release_view(tag: str, cwd: Optional[Path] = None) -> Optional[dict]:
+    """查 release 是否存在（gh 路径）。存在返回 dict(url, assets[])，否则 None。
+
+    cwd 必须指向「已设置目标仓库 remote 的 git 目录」，否则 gh 会作用到
+    进程当前目录（可能是工具自身仓库），导致 Release 误打到错误仓库。
+    """
     r = _run(["gh", "release", "view", tag, "--json", "url,assets",
               "-q", ".url + \"\\n\" + (.assets | map(.name) | join(\"\\n\"))"],
-             check=False)
+             cwd=str(cwd) if cwd else None, check=False)
     if r.returncode != 0:
         return None
     lines = [l for l in r.stdout.splitlines() if l.strip()]
@@ -281,40 +285,46 @@ def _gh_release_view(tag: str) -> Optional[dict]:
     return {"url": url, "assets": asset_names}
 
 
-def _gh_upload_asset(tag: str, asset: Path) -> None:
-    """向已有 release 续传资产（gh 路径）。"""
-    _run(["gh", "release", "upload", tag, str(asset)], check=True)
+def _gh_upload_asset(tag: str, asset: Path, cwd: Optional[Path] = None) -> None:
+    """向已有 release 续传资产（gh 路径）。cwd 同 _gh_release_view。"""
+    _run(["gh", "release", "upload", tag, str(asset)],
+         cwd=str(cwd) if cwd else None, check=True)
 
 
 def create_release(owner: str, repo: str, tag: str, name: str, notes: str,
-                  asset_path: Optional[Path] = None, token: Optional[str] = None) -> str:
+                  asset_path: Optional[Path] = None, token: Optional[str] = None,
+                  cwd: Optional[Path] = None) -> str:
     """创建 GitHub Release，可选附带一个资产文件（zip）。返回 html_url。
 
     幂等（缺陷3修复）：创建前先查重，已存在且资产齐则跳过；撞 already-exists
     报错时查重后续传资产，而非直接抛异常（避免发布链路在「仓库已建、代码已推」
     之后断裂）。
+
+    cwd 在 gh 路径下必须指向「已设置目标仓库 remote 的 git 目录」（临时发布目录），
+    否则 gh 会作用到进程当前目录（工具自身仓库），导致 Release 误打到错误仓库。
     """
     if detect_gh():
-        existing = _gh_release_view(tag)
+        existing = _gh_release_view(tag, cwd=cwd)
         if existing:
             # 已存在：资产齐全则跳过；缺失则续传后返回（幂等补传）
             if asset_path and asset_path.name not in existing["assets"]:
-                _gh_upload_asset(tag, asset_path)
+                _gh_upload_asset(tag, asset_path, cwd=cwd)
             return existing["url"]
         cmd = ["gh", "release", "create", tag, "--title", name, "--notes", notes]
         if asset_path:
             cmd.append(str(asset_path))
-        r = _run(cmd, check=False)
+        r = _run(cmd, cwd=str(cwd) if cwd else None, check=False)
         if r.returncode != 0:
             if "already exists" in r.stderr.lower():
                 # 后端 tag 状态不一致误报：查重后补传资产，不抛
-                re_view = _gh_release_view(tag)
+                re_view = _gh_release_view(tag, cwd=cwd)
                 if re_view:
                     if asset_path and asset_path.name not in re_view["assets"]:
-                        _gh_upload_asset(tag, asset_path)
+                        _gh_upload_asset(tag, asset_path, cwd=cwd)
                     return re_view["url"]
             raise RuntimeError(f"gh release create 失败：{r.stderr.strip()}")
-        out = _run(["gh", "release", "view", tag, "--json", "url", "-q", ".url"], check=False)
+        out = _run(["gh", "release", "view", tag, "--json", "url", "-q", ".url"],
+                   cwd=str(cwd) if cwd else None, check=False)
         return out.stdout.strip() or f"https://github.com/{owner}/{repo}/releases/tag/{tag}"
 
     token = token or os.environ.get("GITHUB_TOKEN")

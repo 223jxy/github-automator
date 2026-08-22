@@ -146,11 +146,20 @@ def generate_readme(info: ProjectInfo, repo_url: Optional[str] = None,
 
 
 def write_readme(root: Path, info: ProjectInfo, repo_url: Optional[str] = None,
-                 force: bool = False, title: Optional[str] = None) -> Path:
-    """写入 README.md；已存在且不 force 时跳过。"""
+                 force: bool = False, title: Optional[str] = None,
+                 dry_run: bool = False) -> Path | str:
+    """写入 README.md；已存在且不 force 时跳过。
+
+    dry_run=True 时仅返回生成的文本而不写入任何文件（用于「源项目只读」的
+    临时目录发布流程：源项目已有 README 则跳过；缺失时把文本交给调用方写入
+    临时发布目录，避免污染用户项目）。
+    """
     root = Path(root)
     target = root / "README.md"
     if target.exists() and not force:
         return target
-    target.write_text(generate_readme(info, repo_url, title), encoding="utf-8")
+    text = generate_readme(info, repo_url, title)
+    if dry_run:
+        return text
+    target.write_text(text, encoding="utf-8")
     return target

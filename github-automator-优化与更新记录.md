@@ -135,3 +135,52 @@ grep -c "__pycache__\|\*.pyc" .gitignore   # 命中，Python 片段已补全
 - 真实验证（可选）：在任意项目跑工具，核查远程根目录不含 `.workbuddy/`。
 
 > 设计原则保持：纯标准库、token 不落盘、轻量可落地。
+
+---
+
+## 八、Phase 7 — 临时目录发布（修复污染源项目 + Release 误打仓库）（2026-08-23）
+
+真实发布第三方项目 `网盘整理工具/netdisk-organizer` 到 `223jxy/netdisk-organizer` v1.0.0 时，暴露两个工具缺陷（已记入《缺陷修复清单》缺陷 5 / 缺陷 6）。
+
+### 缺陷 5：发布直接 `git init` 源项目，污染用户工作区
+- **现象**：`run()` 在**源项目目录**就地 `git init` / `commit` / 生成 `dist/`。`netdisk-organizer` 本不是 git 仓库，被强制 git 化；且源项目残留 `dist/` 工具产物。
+- **修复**：发布所有 git 操作与 zip 生成**迁移到临时目录**（`tempfile.TemporaryDirectory`）。`run()` 第 113–167 行重构：
+  1. 过滤后 `shutil.copy2` 源码到 `stage`（源项目只读）；
+  2. 仅当源项目缺失 `.gitignore`/`README` 时，把生成内容写入 `stage`（不污染源项目）；
+  3. `git init/add/commit/push` 仅作用于 `stage`；
+  4. zip 生成到临时目录顶层 `tmp`（不进 `stage` 的 git 历史，仅作 Release asset）。
+- **收益**：源项目零污染，工具彻底符合"只读源项目"假设；修复了 commit 守卫误判（`dist/` 被安全规则排除后 `git status` 仍有未跟踪输出，曾误触发 commit 崩溃）。
+
+### 缺陷 6：`create_release` 的 gh 路径未传 `cwd`，Release 误打仓库
+- **现象**：`gh release create` 默认作用「进程 cwd」的 git remote（工具工作区 `github-automator`），导致 `netdisk-organizer` 的 Release 被误打到 `github-automator` 仓库。
+- **修复**：`create_release` / `_gh_release_view` / `_gh_upload_asset` 增加 `cwd` 参数；`cli.run` 调用传 `cwd=stage`（其 remote 指向目标仓库）。
+
+### 改动文件
+| 文件 | 改动 |
+|------|------|
+| `cli.py` | `run()` 重构为临时目录发布；新增 `import shutil/tempfile`；`create_release` 调用传 `cwd=stage`；`make_release_zip` 的 `dest_dir` 改为临时目录顶层 |
+| `github.py` | `create_release` / `_gh_release_view` / `_gh_upload_asset` 增加 `cwd` 参数（gh 路径用 `cwd` 执行） |
+| `docgen.py` | `write_readme` 增加 `dry_run` 参数（仅返回文本不写文件，供源项目只读场景使用） |
+| `tests/test_cli.py` | 新增 `TestRunDoesNotPolluteSource`（`test_source_project_untouched_no_git_no_dist_added`、`test_source_with_only_untracked_dist_does_not_crash`），断言源项目零污染 + `create_release` 收到正确 `cwd`/`repo` |
+
+### 验证
+- `python -m unittest discover -s tests` → **Ran 50 tests ... OK**（原 48 + 新增 2）。
+- 真实验证：`netdisk-organizer` 发布后
+  - 源项目 `ls`：无 `.git` ✅、无 `dist` ✅、文件集合未变 ✅；
+  - 远程仓库 `223jxy/netdisk-organizer` 根目录 13 项，无 `.workbuddy`/`state/`/`dist`/密钥 ✅；
+  - Release `v1.0.0` 正确创建于 `netdisk-organizer` 自身仓库并含 `netdisk-organizer-v1.0.0.zip` asset ✅。
+
+> 设计原则保持：纯标准库、token 不落盘、轻量可落地。临时目录发布不引入任何新依赖。
+
+---
+
+## 九、版本发布对照（累计）
+
+| Phase | 版本 | 测试数 | 关键内容 |
+|-------|------|--------|----------|
+| 初版 | v0.1.0 | 10 | 基础流水线 |
+| 优化文档 | — | 20 | dry-run 零写入 / 自定义 gitignore / 凭据健壮 |
+| Phase 4 | — | 31 | 发布凭据健壮性 T1–T5 |
+| Phase 5 | v1.1.0~v1.2.0 | 46 | 缺陷1/2/3 + 汉转英 + 零交互 |
+| Phase 6 | v1.3.0 | 48 | `git add -A` 隐私隐患修复 |
+| Phase 7 | （修复后重发 netdisk-organizer） | 50 | 临时目录发布 + Release 精确打仓库 |

@@ -21,8 +21,10 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,7 +32,8 @@ from .analyzer import analyze
 from .docgen import write_readme
 from .github import create_release, create_repo, get_authenticated_user, has_commit, push
 from .han2py import han_to_repo_name
-from .packager import make_release_zip, write_gitignore, should_include, GitignoreMatcher
+from .packager import (make_release_zip, write_gitignore, generate_gitignore,
+                       should_include, GitignoreMatcher)
 
 VERSION = "0.1.0"
 
@@ -100,60 +103,86 @@ def run(project: Path, repo: str, version: str, private: bool,
              f"标签 {version}")
         return 0
 
-    # 1) 生成 .gitignore（已存在则跳过；--refresh-gitignore 可强制刷新）
-    gi = write_gitignore(project, info, force=refresh_gitignore)
-    _log(f"已写入/确认 .gitignore：{gi}")
+    # 1) 生成 .gitignore（仅在源项目缺失时生成「内容」，但写入临时发布目录而非污染源项目）
+    gi_text = generate_gitignore(info) if (not (project / ".gitignore").exists() or refresh_gitignore) else None
 
-    # 2) 生成 README（已存在且未 force 则跳过）
-    readme = write_readme(project, info, force=force_readme, title=repo)
-    _log(f"已写入/确认 README：{readme}")
+    # 2) README（同上：缺失才生成内容，写入临时发布目录）
+    readme_text = write_readme(project, info, force=force_readme, title=repo, dry_run=True) \
+        if not (project / "README.md").exists() else None
 
-    # 3) 打 Release zip 快照
-    zip_path = make_release_zip(project, info, version, project / "dist", archive_name=repo)
-    _log(f"已生成发布快照：{zip_path}")
+    # 4) 暂存到临时目录并 git 初始化与提交
+    #    关键修复：发布操作全部在临时目录进行，源项目保持只读（不在用户项目里 git init，
+    #    避免把「非 git 项目」误 git 化；也不在源项目残留 .git / dist / 发布 zip）。
+    with tempfile.TemporaryDirectory(prefix="gh-auto-") as tmp:
+        tmp = Path(tmp)
+        stage = tmp / repo
+        stage.mkdir(parents=True, exist_ok=True)
+        gitignore = GitignoreMatcher(project)
+        copied = 0
+        for p in sorted(project.rglob("*")):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(project)
+            if ".git" in rel.parts or ".workbuddy" in rel.parts or "dist" in rel.parts:
+                continue
+            if should_include(p, project, gitignore=gitignore):
+                dest = stage / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, dest)
+                copied += 1
+        _log(f"已暂存 {copied} 个文件到临时发布目录（源项目未改动）。")
+        # 源项目缺 .gitignore / README 时，把生成内容补进临时目录（不污染源项目）
+        if gi_text is not None:
+            (stage / ".gitignore").write_text(gi_text, encoding="utf-8")
+        if readme_text is not None:
+            (stage / "README.md").write_text(readme_text, encoding="utf-8")
 
-    # 4) git 初始化与提交
-    if not (project / ".git").exists():
-        _git(["init"], cwd=project)
-        _git(["checkout", "-b", "main"], cwd=project, check=False)
-    _git_add_safe(project)  # 安全暂存：永不包括 .workbuddy 等敏感目录
-    # 若无可提交内容则跳过提交
-    status = _git(["status", "--porcelain"], cwd=project, check=False)
-    if status.stdout.strip():
-        # check=True：提交失败（如未配置 git 身份）直接抛出，不再静默吞掉
-        _git(["commit", "-m", message], cwd=project)
-        _log("已提交本地改动。")
-    else:
-        _log("无可提交改动，跳过 commit。")
+        _git(["init"], cwd=stage)
+        _git(["checkout", "-b", "main"], cwd=stage, check=False)
+        _git(["add", "-A"], cwd=stage)  # 临时目录只含已过滤的干净文件，安全
+        # 守卫：仅在确有暂存内容时才提交，避免「空 add」触发 git 报错退出
+        diff = _git(["diff", "--cached", "--quiet"], cwd=stage, check=False)
+        if diff.returncode != 0:
+            # check=True：提交失败（如未配置 git 身份）直接抛出，不再静默吞掉
+            _git(["commit", "-m", message], cwd=stage)
+            _log("已提交本地改动（临时发布目录）。")
+        else:
+            _log("无可提交改动，跳过 commit。")
 
-    # 5) 创建仓库 + 推送
-    # 安全闸门：本地无任何提交时直接失败，避免创建空 GitHub 仓库
-    if not has_commit(project):
-        raise RuntimeError("本地无提交，无法推送（避免创建空 GitHub 仓库）。"
-                           "请确认 git 身份已配置或项目有可提交内容。")
-    owner = get_authenticated_user(token)
-    _log(f"已登录 GitHub 用户：{owner}")
-    repo_info = create_repo(repo, info.description, private, token)
-    _log(f"仓库已就绪：{repo_info['html_url']}")
-    push(project, repo_info["clone_url"], token)
-    _log("已推送到 GitHub。")
+        # 3) 打 Release zip 快照（生成到临时目录顶层 tmp，而非 stage 内——
+        #    保证 zip 不会被 git 跟踪进仓库历史，仅作为 Release asset 上传）
+        zip_path = make_release_zip(stage, info, version, tmp, archive_name=repo)
+        _log(f"已生成发布快照：{zip_path}")
 
-    # 6) 创建 Release（可选）
-    if make_release:
-        rel_url = create_release(
-            owner=repo_info["owner"], repo=repo_info["repo"], tag=version,
-            name=f"{repo} {version}",
-            notes=f"自动化发布 by github-automator @ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
-            asset_path=zip_path if zip_path.exists() else None,
-            token=token,
-        )
-        _log(f"已创建 Release：{rel_url}")
-    else:
-        _log("按配置跳过 Release 创建。")
+        # 5) 创建仓库 + 推送
+        # 安全闸门：本地无任何提交时直接失败，避免创建空 GitHub 仓库
+        if not has_commit(stage):
+            raise RuntimeError("本地无提交，无法推送（避免创建空 GitHub 仓库）。"
+                               "请确认 git 身份已配置或项目有可提交内容。")
+        owner = get_authenticated_user(token)
+        _log(f"已登录 GitHub 用户：{owner}")
+        repo_info = create_repo(repo, info.description, private, token)
+        _log(f"仓库已就绪：{repo_info['html_url']}")
+        push(stage, repo_info["clone_url"], token)
+        _log("已推送到 GitHub。")
 
-    _log("完成 ✅")
-    print(f"\n仓库地址：{repo_info['html_url']}")
-    return 0
+        # 6) 创建 Release（可选）；cwd=stage 确保 gh 作用到目标仓库而非工具自身仓库
+        if make_release:
+            rel_url = create_release(
+                owner=repo_info["owner"], repo=repo_info["repo"], tag=version,
+                name=f"{repo} {version}",
+                notes=f"自动化发布 by github-automator @ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+                asset_path=zip_path if zip_path.exists() else None,
+                token=token,
+                cwd=stage,
+            )
+            _log(f"已创建 Release：{rel_url}")
+        else:
+            _log("按配置跳过 Release 创建。")
+
+        _log("完成 ✅")
+        print(f"\n仓库地址：{repo_info['html_url']}")
+        return 0
 
 
 def main(argv: list[str] | None = None) -> int:

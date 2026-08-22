@@ -49,22 +49,23 @@ python cli.py . --repo secret --private --token ghp_xxx
 | `packager.py` | 生成 `.gitignore` + 打干净 zip | 按识别到的生态拼 `.gitignore` 片段；zip 排除忽略目录与大文件 |
 | `docgen.py` | 生成 `README.md` | 用 HTML 注释作隐形标记，让分析器能识别"自生成"并避免回环 |
 | `github.py` | 建仓库 / 推送 / 建 Release | 认证优先级：`gh` CLI → REST API（token 来自参数或 `GITHUB_TOKEN`） |
-| `cli.py` | 参数解析 + 6 步编排 | `argparse`，支持 `--dry-run` / `--private` / `--token` / `--no-release` / `--force-readme` / `--refresh-gitignore`；缺省仓名=目录名汉转英，全链路零交互 |
+| `cli.py` | 参数解析 + 6 步编排 | `argparse`，支持 `--dry-run` / `--private` / `--token` / `--no-release` / `--force-readme` / `--refresh-gitignore`；缺省仓名=目录名汉转英，全链路零交互。**发布全程在临时目录进行，源项目保持只读**（不 git 化、不留 `.git`/`dist`） |
 | `han2py.py` | 目录名「汉转英」 | 汉字逐音节转小写拼音并以 `-` 分隔；数据依赖 vendored `_han2py.json`（GB2312 6763 字，零运行时依赖） |
 | `cli.py`（根） | 薄入口，等价 `python -m github_automator.cli` | 仅做 `sys.path` 注入后转发 `main()` |
-| `tests/` | 单元测试 | 覆盖 `analyzer` / `packager` / `docgen` / `cli` / `github` / `han2py` 共 48 个用例 |
+| `tests/` | 单元测试 | 覆盖 `analyzer` / `packager` / `docgen` / `cli` / `github` / `han2py` 共 50 个用例 |
 
 **数据流**：`analyze()` → `ProjectInfo` →（打包 / 文档 / 推送）全程以同一个 `ProjectInfo` 为载体，模块间解耦清晰。
 
 ```
 cli.run(project)
-   └─ analyze(project)            → ProjectInfo
-   └─ write_gitignore(info)       → .gitignore
-   └─ write_readme(info)          → README.md
-   └─ make_release_zip(info)      → dist/<repo>-<version>.zip
-   └─ [git init / add / commit]
-   └─ create_repo() + push()     → GitHub
-   └─ create_release(asset=zip)   → GitHub Release
+   └─ analyze(project)            → ProjectInfo（只读源项目）
+   └─ [临时目录 stage = tempdir/<repo>]
+        └─ 过滤后复制源码到 stage（源项目零写入）
+        └─ write_gitignore / write_readme（仅当源项目缺失时，写入 stage 而非源项目）
+        └─ [git init / add -A / commit]   ← 仅作用于临时目录
+        └─ make_release_zip(stage) → tempdir/<repo>-<version>.zip（不进 git 历史）
+   └─ create_repo() + push(stage) → GitHub
+   └─ create_release(asset=zip, cwd=stage) → GitHub Release（精确打到目标仓库）
 ```
 
 ---
@@ -77,6 +78,8 @@ cli.run(project)
 4. **自识别标记防回环**（巧妙）：生成的 README 含 `<!-- 本 README 由 github-automator 自动生成 -->`，分析器读到这个标记就不把它当"真实项目简介"复用——避免了"用自生成 README 再生成 README"的死循环。
 5. **认证优先级合理**：优先 `gh`（token 不落盘），回退 API。
 6. **跨平台**：全程 `pathlib`，无硬编码路径分隔符。
-7. **测试通过且能自举**：48 个单测全绿，工具对自身可端到端跑通（含 dry-run 零写入、缺陷回归测试）。
+7. **测试通过且能自举**：50 个单测全绿，工具对自身可端到端跑通（含 dry-run 零写入、缺陷回归测试）。
 8. **发布安全**：提交用 `_git_add_safe` 显式过滤，永不包括 `.workbuddy/` 等本地元数据（隐私红线）；Release 创建幂等（查重+续传资产），不因数次中断而崩。
 9. **零交互 + 汉转英仓名**：给路径即全链路跑完；未指定 `--repo` 时仓库名自动从目录名转拼音 slug，无需人工干预。
+10. **源项目零污染（Phase 7 新增）**：发布的所有 git 操作（init/add/commit/push）与 zip 生成都在**临时目录**完成，源项目保持只读——不会把"非 git 项目"误 git 化，也不残留 `.git`/`dist`；且仅当源项目缺失 `.gitignore`/`README` 时才把生成内容写入临时目录，绝不写回源项目。
+11. **Release 精确到目标仓库（Phase 7 新增）**：`gh release create` 必须带 `cwd=stage`（临时发布目录，其 remote 指向目标仓库），否则会误打到工具自身仓库的工作目录；已修复。

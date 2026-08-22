@@ -1,4 +1,4 @@
-"""cli 模块测试：重点验证 --dry-run 真正只读、不落盘。"""
+"""cli 模块测试：重点验证 --dry-run 真正只读、不落盘，以及发布不污染源项目。"""
 
 import tempfile
 import unittest
@@ -77,6 +77,89 @@ class TestGitAddSafe(unittest.TestCase):
                 _git_add_safe(root)
             self.assertIn(str(root / "main.py"), added)
             self.assertNotIn(str(root / "secret.txt"), added)
+
+
+def _fake_repo_info(name: str) -> dict:
+    return {"owner": "tester", "repo": name,
+            "clone_url": f"https://github.com/tester/{name}.git",
+            "html_url": f"https://github.com/tester/{name}"}
+
+
+class TestRunDoesNotPolluteSource(unittest.TestCase):
+    """发布修复验证：源项目保持只读，不产生 .git / dist；Release 打到正确仓库。
+
+    模拟网络相关函数（create_repo / push / create_release / get_authenticated_user），
+    真实执行 git init/commit 于临时目录，验证源项目零污染 + create_release 收到 cwd。
+    """
+
+    def _make_project(self, root: Path):
+        (root / "main.py").write_text("print('hello')\n")
+        (root / "README.md").write_text("# demo\n")
+        (root / "dist").mkdir()
+        (root / "dist" / "old.zip").write_text("stale asset\n")  # 源项目已有 dist（未跟踪）
+
+    def test_source_project_untouched_no_git_no_dist_added(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "myproj"
+            root.mkdir()
+            self._make_project(root)
+            before = sorted(p.name for p in root.iterdir())
+
+            captured = {}
+            with mock.patch("github_automator.cli.create_repo",
+                            return_value=_fake_repo_info("myproj")), \
+                 mock.patch("github_automator.cli.push", return_value=None), \
+                 mock.patch("github_automator.cli.get_authenticated_user",
+                            return_value="tester"), \
+                 mock.patch("github_automator.cli.create_release",
+                            side_effect=lambda **kw: captured.update(kw) or "https://x"):
+                rc = run(root, repo="myproj", version="v1.0.0", private=False,
+                         token=None, message="x", make_release=True, dry_run=False,
+                         force_readme=False)
+
+            self.assertEqual(rc, 0)
+            # 源项目不应被 git 化，也不应新增 .git
+            self.assertFalse((root / ".git").exists())
+            # 源项目文件集合不应因发布而增加（dist/old.zip 本就存在，不算新增）
+            after = sorted(p.name for p in root.iterdir())
+            self.assertEqual(before, after)
+            # 关键：create_release 必须收到 cwd（临时发布目录），而非工具自身目录，
+            # 否则 gh 会把 Release 误打到工具仓库
+            self.assertIn("cwd", captured)
+            self.assertIsNotNone(captured["cwd"])
+            self.assertNotEqual(Path(captured["cwd"]), Path.cwd())
+            # repo 参数必须是目标仓库名，而非工具自身仓库
+            self.assertEqual(captured["repo"], "myproj")
+
+    def test_source_with_only_untracked_dist_does_not_crash(self):
+        # 源项目无源码、仅有一个未跟踪 dist（被安全规则排除）时，工具仍会补生成
+        # .gitignore / README.md 进临时目录，使临时目录有可提交内容；链路应能正常
+        # 完成（rc=0）而非误触发 commit 崩溃，且源项目零污染。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "onlydist"
+            root.mkdir()
+            (root / "dist").mkdir()
+            (root / "dist" / "x.zip").write_text("asset\n")
+            before = sorted(p.name for p in root.iterdir())
+            captured = {}
+            with mock.patch("github_automator.cli.create_repo",
+                            return_value=_fake_repo_info("onlydist")), \
+                 mock.patch("github_automator.cli.push", return_value=None), \
+                 mock.patch("github_automator.cli.get_authenticated_user",
+                            return_value="tester"), \
+                 mock.patch("github_automator.cli.create_release",
+                            side_effect=lambda **kw: captured.update(kw) or "https://x"):
+                rc = run(root, repo="onlydist", version="v1.0.0", private=False,
+                         token=None, message="x", make_release=True, dry_run=False,
+                         force_readme=False)
+            self.assertEqual(rc, 0)
+            # 源项目零污染：无 .git，文件集合不变
+            self.assertFalse((root / ".git").exists())
+            after = sorted(p.name for p in root.iterdir())
+            self.assertEqual(before, after)
+            # Release 打到正确仓库 + 带 cwd
+            self.assertEqual(captured.get("repo"), "onlydist")
+            self.assertIn("cwd", captured)
 
 
 if __name__ == "__main__":
