@@ -25,7 +25,7 @@ python cli.py . --private --token ghp_xxx
 ```
 
 - 认证：优先用已登录的 `gh` CLI（token 不落盘）；否则用 `--token` 或环境变量 `GITHUB_TOKEN`。
-- 验证测试：`python -m unittest discover -s tests -v`（期望 Ran 20 tests ... OK）。
+- 验证测试：`python -m unittest discover -s tests -v`（期望 Ran 31 tests ... OK）。
 
 ## 核心模块
 

@@ -225,9 +225,12 @@ def make_release_zip(root: Path, info: ProjectInfo, version: str, dest_dir: Path
         if p.is_file() and should_include(p, root, gitignore=gitignore):
             files.append(p)
 
+    # 归档内顶层目录统一用 archive_name（即仓库名/--repo），使 zip 文件名、
+    # 解压目录名、GitHub 仓库名三者一致（避免中文目录名随 info.name 渗入）。
+    top_dir = (archive_name or info.name).replace(" ", "-")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for p in files:
-            arcname = f"{info.name}/{p.relative_to(root).as_posix()}"
+            arcname = f"{top_dir}/{p.relative_to(root).as_posix()}"
             zf.write(p, arcname)
 
     return zip_path

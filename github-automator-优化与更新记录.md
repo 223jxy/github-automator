@@ -58,5 +58,28 @@ grep -c "__pycache__\|\*.pyc" .gitignore   # 命中，Python 片段已补全
 | P2 cli/github 无测试 | ✅ 已补充（20 用例） |
 | P1 不读取项目原有 `.gitignore`（zip 尊重自定义规则） | ✅ 已修复（新增 `GitignoreMatcher`） |
 | P1 push 先推后判 remote / `check=False` 吞错 | ✅ 已修复（`_git_check` 显式抛错 + `has_commit()` 闸门） |
+| Phase 4 发布凭据健壮性（T1–T5） | ✅ 代码已落地（详见第五节）；提交与重发见下文 |
 
 > **收尾状态**：原分析的 P0、全部 P1 及 P2 中"README 引用不存在的 requirements.txt""cli/github 无测试"均已落地并验证。仅剩 P2 中"重复运行幂等/已发布检测"（问题 6）与"依赖解析展示增强"（问题 10）列为后续可选打磨项——二者均不影响当前工具的可用性与安全性，故按"轻量化、低成本可落地"原则暂不实施。
+>
+> **版本化说明（2026-08-23 复审后补）**：Phase 4（T1–T5）代码改动在落地时**未及时提交 git**，导致远程仓库与 Release v1.0.0 一度不含这些修复。经全量复审（见《审核报告》）发现后，已在本轮统一提交并重新发布，恢复"自举闭环"。测试用例数自 22 增至 **31**。
+
+---
+
+## 五、Phase 4 — 发布凭据健壮性（2026-08-23 真实发布测试后）
+
+基于首次真实发布（建仓+提交+打包成功，但 `git push` 因 gh 未 `setup-git` 失败）暴露的 5 个问题（T1–T5，详见《测试问题分析与优化清单》），全部落地：
+
+| 项 | 问题 | 改动位置 | 验证 |
+|----|------|----------|------|
+| T1 | gh 路径推送未降级 | `github.py` `push()` 新增 gh 分支降级：凭据不可用时局部配置 gh credential helper 兜底并重试一次（不写全局、不暴露明文 token） | `test_push_gh_path_degrades_on_credential_error` |
+| T2 | 发布前无凭据预检 | `github.py` 新增 `_check_git_credentials()`，`push()` 开头调用，凭据缺失早失败并提示 `gh auth setup-git` / `GITHUB_TOKEN` | `test_check_git_credentials_*` |
+| T3 | 测试未覆盖 push 降级 | `test_github.py` 新增 `TestPush` + `TestCheckCredentials`（mock 不触网） | 用例 22 → 31，全绿 |
+| T4 | 规范手册未记该坑 | 规范手册 1.3 增补发布凭据预检；新增 5.3 凭据通道节 | 文档审查 |
+| T5 | 推送失败信息未指向根因 | `github.py` `_git_check` 的 `_CREDENTIAL_ERROR_HINTS` 语义化（命中"could not read Username/tty"等附加根因提示）；并补 git 缺失兜底 | `test_git_check_credential_error_hint` / `test_git_check_missing_git_binary` |
+
+**实现中修复的附加 bug**：T1 首次实现时 `push()` gh 分支 `except` 块末尾无条件 `raise`，导致降级重试成功仍抛原错——被 `test_push_gh_path_degrades_on_credential_error` 暴露后改为"降级成功即 return"。
+
+**当前测试总数**：31（原 22 + 新增 9）。`python -m unittest discover -s tests` → **Ran 31 tests ... OK**。
+
+> 设计原则保持：纯标准库、token 不落盘、轻量可落地。Phase 4 未引入任何第三方依赖。

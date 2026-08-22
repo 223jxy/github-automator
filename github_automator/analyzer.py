@@ -243,12 +243,12 @@ def analyze(root: Path, max_tree_depth: int = 3) -> ProjectInfo:
         eco.append(LANG_TO_ECOSYSTEM[info.primary_language])
     info.ecosystems = eco
 
-    # 简介：优先复用已有 README 首段；但若是本工具自生成的（带标记），则用默认文案避免回环
+    # 简介：优先复用已有 README 首段；但若是本工具自生成的（带标记），则用默认文案避免回环。
+    # 防护标记与 docgen.generate_readme 中的 HTML 注释保持一致："github-automator 自动生成"。
     if info.existing_readme and "github-automator 自动生成" not in info.existing_readme:
         for para in info.existing_readme.split("\n\n"):
             para = para.strip().lstrip("#").strip().lstrip(">").strip()
-            if para and len(para) > 10 and "github-automator" not in para \
-               and "自动生成" not in para and "自动化提交与发布工具生成" not in para:
+            if para and len(para) > 10 and "github-automator" not in para:
                 info.description = para[:200]
                 break
     if not info.description:

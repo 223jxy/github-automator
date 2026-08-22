@@ -7,7 +7,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from github_automator.github import build_push_url, has_commit, _git_check, create_repo
+from github_automator.github import (
+    build_push_url, has_commit, _git_check, create_repo, push, _check_git_credentials,
+    _CREDENTIAL_ERROR_HINTS,
+)
 
 
 def _git_available() -> bool:
@@ -47,9 +50,19 @@ class TestHasCommit(unittest.TestCase):
 
 class TestGitCheck(unittest.TestCase):
     def test_git_check_raises_on_failure(self):
-        # 非法 git 参数 -> 非零退出 -> 应当抛出带上下文的 RuntimeError
-        with self.assertRaises(RuntimeError):
-            _git_check(["git", "rev-parse", "--no-such-flag"], cwd=".")
+        # git 返回非零 -> 应当抛出带上下文的 RuntimeError（mock 隔离，不依赖真实 git）
+        err = _FakeCompleted(returncode=1, stderr="some git error")
+        with mock.patch("github_automator.github._run", return_value=err):
+            with self.assertRaises(RuntimeError):
+                _git_check(["git", "rev-parse", "--no-such-flag"], cwd=".")
+
+    def test_git_check_missing_git_binary(self):
+        # git 可执行文件缺失（FileNotFoundError）-> 转为明确 RuntimeError
+        with mock.patch("github_automator.github._run",
+                        side_effect=FileNotFoundError("git not found")):
+            with self.assertRaises(RuntimeError) as ctx:
+                _git_check(["git", "status"], cwd=".")
+            self.assertIn("git 可执行文件", str(ctx.exception))
 
 
 class TestCreateRepo(unittest.TestCase):
@@ -83,6 +96,114 @@ class TestCreateRepo(unittest.TestCase):
             info = create_repo("mine", token="dummy")
             self.assertEqual(info["repo"], "mine")
             self.assertEqual(info["owner"], "u")
+
+
+class _FakeCompleted:
+    """模拟 subprocess.CompletedProcess，供 _run mock 使用。"""
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class TestCheckCredentials(unittest.TestCase):
+    """_check_git_credentials：凭据通道预检（T2）。"""
+
+    def test_no_gh_no_token_raises(self):
+        # 无 gh 且无 GITHUB_TOKEN -> 早失败并提示
+        with mock.patch("github_automator.github.detect_gh", return_value=False), \
+             mock.patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(RuntimeError) as ctx:
+                _check_git_credentials(Path("."))
+            self.assertIn("GITHUB_TOKEN", str(ctx.exception))
+
+    def test_token_env_passes(self):
+        # 无 gh 但有 GITHUB_TOKEN -> 通过（不抛）
+        with mock.patch("github_automator.github.detect_gh", return_value=False), \
+             mock.patch.dict("os.environ", {"GITHUB_TOKEN": "ghp_x"}, clear=True):
+            _check_git_credentials(Path("."))  # 不应抛
+
+    def test_gh_logged_in_passes(self):
+        # gh 已装且 auth status 成功 -> 通过
+        with mock.patch("github_automator.github.detect_gh", return_value=True), \
+             mock.patch("github_automator.github._run",
+                        return_value=_FakeCompleted(returncode=0)):
+            _check_git_credentials(Path("."))  # 不应抛
+
+    def test_gh_installed_but_not_ready_raises(self):
+        # gh 已装但 auth status 失败 -> 早失败并提示 setup-git
+        with mock.patch("github_automator.github.detect_gh", return_value=True), \
+             mock.patch("github_automator.github._run",
+                        return_value=_FakeCompleted(returncode=1, stderr="not logged in")):
+            with self.assertRaises(RuntimeError) as ctx:
+                _check_git_credentials(Path("."))
+            self.assertIn("setup-git", str(ctx.exception))
+
+
+class TestPush(unittest.TestCase):
+    """push 凭据健壮性（T1/T5）：gh 路径降级、无凭据报错、凭据错误语义化。"""
+
+    def _patch_gh_run(self, push_side_effects):
+        """mock detect_gh=True 且 _run 按调用顺序返回。push_side_effects 为 git push 的返回序列。"""
+        calls = {"push": iter(push_side_effects)}
+
+        def fake_run(cmd, cwd=None, check=True):
+            # cmd 形如 ["git", "-C", <root>, <subcmd>, ...]，subcmd 在索引 3
+            if cmd[:2] == ["git", "-C"] and len(cmd) >= 4 and cmd[3] == "get-url":
+                return _FakeCompleted(returncode=0, stdout="https://github.com/o/r.git\n")
+            if cmd[:2] == ["git", "-C"] and len(cmd) >= 4 and cmd[3] == "add":
+                return _FakeCompleted(returncode=0)
+            if cmd[:2] == ["git", "-C"] and len(cmd) >= 4 and cmd[3] == "push":
+                return next(calls["push"])
+            if cmd[:2] == ["gh", "auth"]:
+                return _FakeCompleted(returncode=0)  # auth status 通过
+            if cmd[:2] == ["git", "-C"] and len(cmd) >= 4 and cmd[3] == "config":
+                return _FakeCompleted(returncode=0)  # 兜底配置 credential helper
+            return _FakeCompleted(returncode=0)
+
+        return mock.patch("github_automator.github.detect_gh", return_value=True), \
+               mock.patch("github_automator.github._run", side_effect=fake_run)
+
+    def test_push_gh_path_degrades_on_credential_error(self):
+        # gh 路径首次推送因「凭据不可用」失败 -> 兜底配置后重试成功（不抛）
+        cred_fail = _FakeCompleted(
+            returncode=1,
+            stderr="fatal: could not read Username for 'https://github.com': No such device or address")
+        ok = _FakeCompleted(returncode=0)
+        p_gh, p_run = self._patch_gh_run([cred_fail, ok])
+        with p_gh, p_run:
+            push(Path("/tmp/x"), "https://github.com/o/r.git")  # 不应抛
+
+    def test_push_gh_path_non_credential_error_still_raises(self):
+        # gh 路径推送因「非凭据」错误（如分支冲突）失败 -> 直接抛出，不盲目降级重试
+        branch_conflict = _FakeCompleted(
+            returncode=1, stderr="! [rejected] main -> main (fetch first)")
+        p_gh, p_run = self._patch_gh_run([branch_conflict])
+        with p_gh, p_run:
+            with self.assertRaises(RuntimeError):
+                push(Path("/tmp/x"), "https://github.com/o/r.git")
+
+    def test_push_no_gh_no_token_raises(self):
+        # 无 gh 且无 token -> 预检即失败，提示 GITHUB_TOKEN
+        # mock _run 隔离 current_branch 的真实 git 调用（避免依赖 PATH）
+        with mock.patch("github_automator.github.detect_gh", return_value=False), \
+             mock.patch.dict("os.environ", {}, clear=True), \
+             mock.patch("github_automator.github._run",
+                        return_value=_FakeCompleted(returncode=0, stdout="main\n")):
+            with self.assertRaises(RuntimeError) as ctx:
+                push(Path("."), "https://github.com/o/r.git")
+            self.assertIn("GITHUB_TOKEN", str(ctx.exception))
+
+    def test_git_check_credential_error_hint(self):
+        # _git_check 对凭据类错误附加根因提示（T5）
+        err = _FakeCompleted(returncode=1,
+                             stderr="fatal: could not read Username for 'https://github.com'")
+        with mock.patch("github_automator.github._run", return_value=err):
+            with self.assertRaises(RuntimeError) as ctx:
+                _git_check(["git", "push"], cwd=".", what="推送")
+            self.assertIn("setup-git", str(ctx.exception))
+            # 关键词确实命中 _CREDENTIAL_ERROR_HINTS
+            self.assertTrue(any(h in "could not read username" for h in _CREDENTIAL_ERROR_HINTS))
 
 
 if __name__ == "__main__":

@@ -30,3 +30,6 @@ credentials.json
 *.log
 tmp/
 temp/
+
+# ===== 本地工作区元数据（含记忆日志，不进项目仓库） =====
+.workbuddy/

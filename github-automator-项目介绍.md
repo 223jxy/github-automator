@@ -51,7 +51,7 @@ python cli.py . --repo secret --private --token ghp_xxx
 | `github.py` | 建仓库 / 推送 / 建 Release | 认证优先级：`gh` CLI → REST API（token 来自参数或 `GITHUB_TOKEN`） |
 | `cli.py` | 参数解析 + 6 步编排 | `argparse`，支持 `--dry-run` / `--private` / `--token` / `--no-release` / `--force-readme` / `--refresh-gitignore` |
 | `cli.py`（根） | 薄入口，等价 `python -m github_automator.cli` | 仅做 `sys.path` 注入后转发 `main()` |
-| `tests/` | 单元测试 | 覆盖 `analyzer` / `packager` / `docgen` / `cli` / `github` 共 20 个用例 |
+| `tests/` | 单元测试 | 覆盖 `analyzer` / `packager` / `docgen` / `cli` / `github` 共 31 个用例 |
 
 **数据流**：`analyze()` → `ProjectInfo` →（打包 / 文档 / 推送）全程以同一个 `ProjectInfo` 为载体，模块间解耦清晰。
 

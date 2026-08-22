@@ -26,14 +26,19 @@
 ```bash
 # 1. 逻辑层全量测试（纯 stdlib，无需 pytest）
 python -m unittest discover -s tests -v
-# 期望：Ran 20 tests ... OK
+# 期望：Ran 31 tests ... OK
 
 # 2. 自举 dry-run：把工具作用于它自己，确认零写入、计划正确
 python -m github_automator.cli . --repo github-automator --dry-run
 # 期望：仅打印计划，dist/ 与 .git/ 不被改动
+
+# 3.（若要做真实发布）凭据通道预检，早失败早提示：
+gh auth status          # 应显示已登录；否则先 `gh auth setup-git`
+# 或设置环境变量 GITHUB_TOKEN=ghp_xxx
 ```
 - 测试不绿 → 不允许提交/推送。
 - dry-run 若产生了文件写入 → 说明"只读"约束被破坏，需回查 `cli.py run()`。
+- 真实发布前必须确认凭据通道可用（`gh auth status` 正常或 `GITHUB_TOKEN` 已设）；工具也会在 `push()` 前自动 `_check_git_credentials` 预检，凭据缺失会早失败并提示 `gh auth setup-git`。
 
 ### 1.4 回滚与故障
 - 本地：一律用 `git` 回退（`git log` 找基线 → `git checkout <sha> -- <file>` 或 `git revert`）。
@@ -158,6 +163,15 @@ github自动化/
 
 - 核心原则：**冲突即失败报错**，把"换名决策"交还给用户，而非工具擅自产生副作用。
 - 实现位置：`github.py` 的 `create_repo()`（gh 路径与非 gh REST 路径均已区分 "already exists" 复用 vs 其他失败报错）。
+
+### 5.3 凭据通道（推送前必读）
+`push()` 依赖 git 能拿到 GitHub 凭据，而 git 默认**不会**自动用 `gh` 凭据——必须显式 `gh auth setup-git` 把 gh 注册为 git credential helper。这是真实发布测试（2026-08-23）暴露的坑，工具已做两层加固：
+
+1. **预检（早失败）**：`push()` 先调 `_check_git_credentials()`，凭据不可用（无 gh 且未设 `GITHUB_TOKEN`）直接抛 `RuntimeError`，提示先 `gh auth setup-git` 或设 `GITHUB_TOKEN`，避免在 push 阶段才暴露。
+2. **降级（兜底）**：gh 路径推送若因"凭据不可用"失败（git 回退到交互式问密码、非交互无 tty），工具运行时为本仓库**局部**配置 git 用 gh 作 credential helper（等效 `gh auth setup-git`，不写全局、不暴露明文 token），重试一次；仍失败才抛出。非凭据错误（如分支冲突）不盲目降级，直接抛出。
+3. **语义化报错**：`_git_check` 命中"could not read Username / /dev/tty / No such file or directory"等凭据类错误时，附加根因提示，避免误判。
+
+> 推荐做法：发布前手动 `gh auth setup-git` 一次即可，工具的降级逻辑是兜底而非替代。
 
 ---
 

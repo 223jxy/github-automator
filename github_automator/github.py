@@ -144,12 +144,32 @@ def build_push_url(clone_url: str, token: Optional[str]) -> str:
     return clone_url
 
 
+# git 凭据类错误关键词：命中即说明 git 无法获取认证，根因通常是未配置 gh 凭据助手或缺失 token
+_CREDENTIAL_ERROR_HINTS = ("could not read username", "/dev/tty", "no such file or directory",
+                           "terminal prompts disabled", "authorization failed",
+                           "authentication failed", "could not resolve host")
+
+
 def _git_check(args: list[str], cwd, what: str = "git 操作") -> subprocess.CompletedProcess:
-    """执行 git 命令；失败则抛出带上下文的 RuntimeError（不再静默吞错）。"""
-    r = _run(args, cwd=str(cwd), check=False)
+    """执行 git 命令；失败则抛出带上下文的 RuntimeError（不再静默吞错）。
+
+    若错误属于「凭据不可用」类（如未配置 gh 凭据助手导致 git 回退到交互式
+    问密码、非交互环境无 tty），额外附上根因提示，避免用户误判为其他错误。
+    若 git 可执行文件本身缺失（FileNotFoundError），也转为明确报错。
+    """
+    try:
+        r = _run(args, cwd=str(cwd), check=False)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"{what}失败：未找到 git 可执行文件。请先安装 Git 并加入 PATH。\n{e}"
+        ) from e
     if r.returncode != 0:
         detail = (r.stderr or r.stdout or "（无错误信息）").strip()
-        raise RuntimeError(f"{what}失败：`{' '.join(args)}`\n{detail}")
+        hint = ""
+        if any(h in detail.lower() for h in _CREDENTIAL_ERROR_HINTS):
+            hint = ("\n根因：git 无法获取 GitHub 凭据——请先 `gh auth setup-git`，"
+                    "或设置 GITHUB_TOKEN 环境变量。")
+        raise RuntimeError(f"{what}失败：`{' '.join(args)}`\n{detail}{hint}")
     return r
 
 
@@ -159,24 +179,80 @@ def has_commit(root) -> bool:
     return r.returncode == 0
 
 
+def _check_git_credentials(root: Path) -> None:
+    """推送前的凭据通道预检：早失败、早提示，避免在 push 阶段才暴露凭据不可用。
+
+    探测顺序：
+    1. 系统装有 gh 且已登录（gh auth status 成功）→ 通过；
+    2. 否则环境变量 GITHUB_TOKEN 已设置 → 通过；
+    3. 否则抛出 RuntimeError，提示用户先 `gh auth setup-git` 或设置 GITHUB_TOKEN。
+    """
+    if detect_gh():
+        r = _run(["gh", "auth", "status"], cwd=str(root), check=False)
+        if r.returncode == 0:
+            return
+        # gh 已装但未登录 / setup-git 未配置：仍可能可用，但给出预警式失败
+        raise RuntimeError(
+            "GitHub 凭据不可用：gh 已安装但未就绪。\n"
+            "请先执行 `gh auth setup-git`（或 `gh auth login`），"
+            "或设置 GITHUB_TOKEN 环境变量后再发布。"
+        )
+    if os.environ.get("GITHUB_TOKEN"):
+        return
+    raise RuntimeError(
+        "GitHub 凭据不可用：未检测到 gh，也未设置 GITHUB_TOKEN。\n"
+        "请先 `gh auth login`（推荐，token 不落盘），或设置 GITHUB_TOKEN 环境变量。"
+    )
+
+
+def _ensure_gh_git_credentials(root: Path) -> None:
+    """gh 路径兜底：确保 git 能用 gh 作为凭据助手（等效 `gh auth setup-git`）。
+
+    仅在本会话为当前仓库配置 credential helper 指向 gh，**不写入用户级全局配置**，
+    也不暴露 gh 的明文 token——安全约定（token 不落盘）不受影响。
+    若 gh 未安装或不可用则静默跳过（交由后续推送逻辑报错）。
+    """
+    if not detect_gh():
+        return
+    _run(["git", "-C", str(root), "config", "--local", "credential.https://github.com.helper",
+          ""], check=False)
+    _run(["git", "-C", str(root), "config", "--local", "credential.https://github.com.useHttpPath",
+          "true"], check=False)
+    # 用 gh 提供的凭据助手（其本身从 gh 安全存储读取 token，脚本拿不到明文）
+    _run(["git", "-C", str(root), "config", "--local", "credential.https://github.com.helper",
+          "!/c/Program\\ Files/GitHub\\ CLI/gh.exe auth git-credential"], check=False)
+
+
 def push(root: Path, clone_url: str, token: Optional[str] = None,
          branch: Optional[str] = None) -> None:
     """把当前提交推送到远程。
 
     安全约束：token 绝不写入 .git/config。
-    - gh 路径：走系统凭据，remote 不含 token。
+    - gh 路径：优先走系统凭据；若推送因「凭据不可用」失败，则运行时兜底配置
+      git 用 gh 作凭据助手（等效 `gh auth setup-git`）并重试一次，仍失败才抛出。
     - 非 gh 路径：仅把「不含 token 的 plain remote」持久化；推送时用内联
       token URL 且不加 -u，避免 branch.<name>.remote 记录 token。
-    任何 git 失败都会显式抛出（不再以 check=False 静默吞掉）。
+    推送前先经 `_check_git_credentials` 预检，凭据缺失则早失败并提示。
     """
     root = Path(root)
     branch = branch or current_branch(root)
+    _check_git_credentials(root)  # T2：推送前预检凭据通道
+
     if detect_gh():
         # gh 走系统凭据，先确保 remote 存在再推送
         r = _run(["git", "-C", str(root), "remote", "get-url", "origin"], check=False)
         if r.returncode != 0:
             _git_check(["git", "-C", str(root), "remote", "add", "origin", clone_url], root, "添加 remote")
-        _git_check(["git", "-C", str(root), "push", "-u", "origin", branch], root, "推送（gh）")
+        try:
+            _git_check(["git", "-C", str(root), "push", "-u", "origin", branch], root, "推送（gh）")
+        except RuntimeError as e:
+            # T1：gh 路径推送失败，若属「凭据不可用」，兜底配置 gh 凭据助手后重试一次；
+            # 重试成功即返回，不再抛出原错误。
+            if any(h in str(e).lower() for h in _CREDENTIAL_ERROR_HINTS):
+                _ensure_gh_git_credentials(root)
+                _git_check(["git", "-C", str(root), "push", "-u", "origin", branch], root, "推送（gh 重试）")
+                return
+            raise  # 非凭据错误（如分支冲突）：直接抛出，不盲目降级
         return
 
     token = token or os.environ.get("GITHUB_TOKEN")

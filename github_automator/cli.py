@@ -132,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         description="把任意项目提炼、打包并自动化提交到 GitHub（含 Release 压缩包）。",
     )
     parser.add_argument("project", nargs="?", default=".", help="项目目录（默认当前目录）")
-    parser.add_argument("--repo", default=None, help="GitHub 仓库名（默认用项目目录名）")
+    parser.add_argument("--repo", default=None, help="GitHub 仓库名（默认用包名 github-automator）")
     parser.add_argument("--version", default="v1.0.0", help="Release 标签（默认 v1.0.0）")
     parser.add_argument("--private", action="store_true", help="创建私有仓库（默认公开）")
     parser.add_argument("--token", default=None, help="GitHub token（无 gh 时使用；也可设环境变量 GITHUB_TOKEN）")
