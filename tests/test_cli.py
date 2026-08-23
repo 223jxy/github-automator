@@ -79,10 +79,11 @@ class TestGitAddSafe(unittest.TestCase):
             self.assertNotIn(str(root / "secret.txt"), added)
 
 
-def _fake_repo_info(name: str) -> dict:
+def _fake_repo_info(name: str, exists: bool = False) -> dict:
     return {"owner": "tester", "repo": name,
             "clone_url": f"https://github.com/tester/{name}.git",
-            "html_url": f"https://github.com/tester/{name}"}
+            "html_url": f"https://github.com/tester/{name}",
+            "exists": exists}
 
 
 class TestRunDoesNotPolluteSource(unittest.TestCase):
@@ -160,6 +161,93 @@ class TestRunDoesNotPolluteSource(unittest.TestCase):
             # Release 打到正确仓库 + 带 cwd
             self.assertEqual(captured.get("repo"), "onlydist")
             self.assertIn("cwd", captured)
+
+
+class TestRunUpdateExistingRepo(unittest.TestCase):
+    """覆盖式更新验证（Phase 8）：远程已有历史时，run 走 force-with-lease 覆盖分支。
+
+    mock 掉网络函数（create_repo/push/create_release/get_authenticated_user），
+    并部分 mock _git：让 `fetch origin main` 与 `reset --hard origin/main` 返回成功
+    （模拟「远程已有内容」），其余 git 调用走真实临时目录 git，验证 push 收到 force=True
+    且源项目零污染。
+    """
+
+    def _make_project(self, root: Path):
+        (root / "main.py").write_text("print('updated')\n")
+        (root / "README.md").write_text("# updated demo\n")
+
+    def test_update_existing_repo_uses_force_push(self):
+        import github_automator.cli as cli_mod
+        real_git = cli_mod._git
+
+        def partial_git(args, cwd=None, check=True):
+            # 模拟「远程已有 main 历史」：fetch / reset 一律成功，其余走真实 git
+            if args[:3] == ["fetch", "origin", "main"]:
+                return mock.MagicMock(returncode=0, stdout="", stderr="")
+            if args[:2] == ["reset", "--hard"]:
+                return mock.MagicMock(returncode=0, stdout="", stderr="")
+            return real_git(args, cwd=cwd, check=check)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "myproj"
+            root.mkdir()
+            self._make_project(root)
+            before = sorted(p.name for p in root.iterdir())
+
+            push_calls = []
+            with mock.patch("github_automator.cli.create_repo",
+                            return_value=_fake_repo_info("myproj", exists=True)), \
+                 mock.patch("github_automator.cli.push",
+                            side_effect=lambda *a, **k: push_calls.append(k) or None), \
+                 mock.patch("github_automator.cli.get_authenticated_user",
+                            return_value="tester"), \
+                 mock.patch("github_automator.cli.create_release",
+                            return_value="https://x"), \
+                 mock.patch("github_automator.cli._git", side_effect=partial_git):
+                rc = run(root, repo="myproj", version="v1.1.0", private=False,
+                         token=None, message="x", make_release=False, dry_run=False,
+                         force_readme=False)
+
+            self.assertEqual(rc, 0)
+            # 源项目零污染
+            self.assertFalse((root / ".git").exists())
+            self.assertEqual(sorted(p.name for p in root.iterdir()), before)
+            # 关键断言：push 被调用且 force=True（覆盖式更新）
+            self.assertEqual(len(push_calls), 1)
+            self.assertTrue(push_calls[0].get("force"),
+                            "更新已存在仓库时 push 必须 force=True")
+
+    def test_update_existing_repo_fetch_failure_raises(self):
+        import github_automator.cli as cli_mod
+        real_git = cli_mod._git
+
+        def partial_git(args, cwd=None, check=True):
+            # 模拟「仓库存在但拉取远程历史失败」：fetch 一律失败，reset 不应被调用
+            if args[:3] == ["fetch", "origin", "main"]:
+                return mock.MagicMock(returncode=1, stdout="", stderr="fetch failed")
+            return real_git(args, cwd=cwd, check=check)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "myproj"
+            root.mkdir()
+            self._make_project(root)
+            before = sorted(p.name for p in root.iterdir())
+
+            with mock.patch("github_automator.cli.create_repo",
+                            return_value=_fake_repo_info("myproj", exists=True)), \
+                 mock.patch("github_automator.cli.push",
+                            side_effect=AssertionError("push 不应被调用")), \
+                 mock.patch("github_automator.cli.get_authenticated_user",
+                            return_value="tester"), \
+                 mock.patch("github_automator.cli._git", side_effect=partial_git):
+                with self.assertRaises(RuntimeError):
+                    run(root, repo="myproj", version="v1.1.0", private=False,
+                        token=None, message="x", make_release=False, dry_run=False,
+                        force_readme=False)
+
+            # 源项目零污染
+            self.assertFalse((root / ".git").exists())
+            self.assertEqual(sorted(p.name for p in root.iterdir()), before)
 
 
 if __name__ == "__main__":

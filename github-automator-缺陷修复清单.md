@@ -243,6 +243,56 @@ with tempfile.TemporaryDirectory(prefix="gh-auto-") as tmp:
 - 单测 `test_source_project_untouched_...` 已断言 `create_release` 被传入 `cwd` 且 `cwd != Path.cwd()`、`repo == "myproj"`（目标仓库名正确）。
 - 真实验证：`netdisk-organizer` 已正确创建 v1.0.0 Release 于自身仓库（✅ `https://github.com/223jxy/netdisk-organizer/releases/tag/v1.0.0`）。
 
+---
+
+## 缺陷 7：覆盖式更新（更新已存在仓库）fetch/reset 引用失效 + lease 过期
+
+> 触发场景：用户要求「更新已上传项目」→ 重新发布同名仓库的新版本（v1.1.0 覆盖 v1.0.0）。
+> 这是 Phase 8「覆盖式更新」能力的真实落地，暴露两个工具自身缺陷。
+
+### 缺陷 7a：覆盖式 `reset` 找不到 `origin/main`
+
+| 项 | 内容 |
+|---|---|
+| 严重度 | 高（覆盖式更新完全不可用） |
+| 位置 | `cli.py` `run()` 覆盖式分支 |
+| 现象 | 初版用 `git fetch origin +refs/heads/main:refs/remotes/origin/main` 试图建立远程跟踪分支，再 `git reset --hard origin/main`。但强制 refspec 写入 `refs/remotes/origin/main` 在部分 git 版本/配置下**偶发未被注册**，导致 `reset` 报 `fatal: ambiguous argument 'origin/main': unknown revision`，覆盖式中止。 |
+| 影响 | 已存在仓库无法用工具更新，只能手工 `gh` 操作。 |
+
+**修复**：改用 `git fetch origin main` + `git reset --hard FETCH_HEAD`。`FETCH_HEAD` 是 fetch 后**必定存在**的引用，不依赖远程跟踪分支注册状态，稳定可靠。
+
+### 缺陷 7b：`--force-with-lease` 因 lease 基准过期被拒（`stale info`）
+
+| 项 | 内容 |
+|---|---|
+| 严重度 | 高（fetch/reset 修复后仍推不上去） |
+| 位置 | `github.py` `push(force=True)` |
+| 现象 | `push --force-with-lease` 默认以 `refs/remotes/origin/main` 为 lease 参考。但临时目录是全新 `git init`，该远程跟踪分支要么不存在、要么未随 `fetch origin main` 可靠更新，导致 git 判 lease 信息过期（`! [rejected] main -> main (stale info)`）。 |
+| 影响 | 覆盖式推送被拒，发布失败。 |
+
+**修复**：`push(force=True)` 时先 `git fetch origin main` 刷新，再 `git rev-parse FETCH_HEAD` 取出远程 main 当前 commit，**显式**作为 lease 期望值：`--force-with-lease=origin/main:<sha>`。既不依赖 `origin/main` 注册状态，又保留「远程被不知情改动时拒绝」的安全语义。
+
+### 附带加固：`create_repo` 返回 `exists` 标记
+
+- 原 `create_repo` 对「已存在同名仓库」静默复用，不返回是否新建。`run()` 无法据此判断首发布 / 覆盖式，只能靠脆弱的 `fetch` 探测。
+- 现 `create_repo`（gh + token 两条路径）均返回 `exists: bool` 字段；`run()` 以 `repo_info["exists"]` 为权威判定：
+  - `exists=True` → 必走覆盖式（`force=True`）。
+  - `exists=False` → 首发布（普通 push）。
+  - `exists=True` 但 `fetch` 失败 → 显式报错（而非静默走首发布撞 non-fast-forward）。
+
+### 验收标准
+- 单测：
+  - `test_update_existing_repo_uses_force_push`：`exists=True` 时 `push(force=True)` 被调用 + 源项目零污染。
+  - `test_update_existing_repo_fetch_failure_raises`：`exists=True` 但 fetch 失败时抛 RuntimeError。
+  - `test_push_force_uses_force_with_lease`：`force=True` 的 push 命令含 `--force-with-lease`（非裸 `--force`）。
+  - `test_push_force_refreshes_origin_main_before_lease`：`force=True` 时先 fetch origin main + rev-parse FETCH_HEAD，再 push。
+- 真实验证：`netdisk-organizer` v1.0.0 → v1.1.0 覆盖式更新成功（✅ `https://github.com/223jxy/netdisk-organizer/releases/tag/v1.1.0`），源项目零污染、远程根目录干净（无 `state/`/`audit/`/`cookie.json`）。
+
+### 环境踩坑记录（重要）
+- 本机 `HTTPS_PROXY=http://127.0.0.1:7897/`（系统代理）。**工具发布必须走代理**：直连 GitHub API/TLS 会被 `Recv failure: Connection was reset` 重置。
+- `unset` 代理反而导致直连失败；正确做法是**保留系统代理环境变量**，让 `gh`/`git` 子进程继承。
+- 验证命令：`gh auth status` + `git ls-remote <repo>` 走代理均正常。
+
 ## 执行顺序建议
 
 | 次序 | 缺陷 | 状态 |
@@ -253,6 +303,9 @@ with tempfile.TemporaryDirectory(prefix="gh-auto-") as tmp:
 | 4 | 缺陷 4（`git add -A` 误推敏感目录） | ✅ 已修复（`_git_add_safe` 替代 `git add -A`，Phase 6） |
 | 5 | 缺陷 5（git init 污染源项目） | ✅ 已修复（临时目录发布，Phase 7） |
 | 6 | 缺陷 6（Release 误打仓库） | ✅ 已修复（`create_release` 传 `cwd=stage`，Phase 7） |
+| 7 | 缺陷 7（覆盖式更新 fetch/reset + lease） | ✅ 已修复（FETCH_HEAD + 显式 lease，Phase 8） |
+
+> 测试总数：31（初版）→ 46（Phase 5）→ 48（Phase 6）→ 50（Phase 7）→ **55**（Phase 8，新增 5 项：覆盖式 force push、fetch 失败报错、push lease 校验 ×2、create_repo exists 标记相关）。
 
 > 测试总数：31（初版）→ 46（Phase 5）→ 48（Phase 6）→ **50**（Phase 7，新增 `TestRunDoesNotPolluteSource` 2 项）。
 

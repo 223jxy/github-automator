@@ -71,12 +71,15 @@ def get_authenticated_user(token: Optional[str] = None) -> str:
 
 def create_repo(name: str, description: str = "", private: bool = False,
                 token: Optional[str] = None) -> dict:
-    """新建仓库，返回 {owner, repo, clone_url, html_url}。
+    """新建仓库，返回 {owner, repo, clone_url, html_url, exists}。
 
     容错契约（详见规范手册「容错契约」节）：
-    - 仓库「已存在且属于你」：复用，继续后续推送/Release；
+    - 仓库「已存在且属于你」：复用（exists=True），继续后续推送/Release；
     - 仓库「已存在但不属于你 / 无权限 / 名字非法」：显式抛出 RuntimeError，
       信息含仓库名与建议（换名或确认权限），**绝不静默、绝不自动改名重试**。
+
+    exists 字段说明：True=同名仓库已存在并复用（覆盖式更新场景），
+    False=本次新创建。run() 据此决定是否必须走覆盖式推送。
     """
     visibility = "private" if private else "public"
     if detect_gh():
@@ -86,14 +89,18 @@ def create_repo(name: str, description: str = "", private: bool = False,
             if "already exists" in r.stderr:
                 # 属于你的仓库（同名复用），继续
                 owner = get_authenticated_user(token)
-                return _repo_info(owner, name, token)
+                info = _repo_info(owner, name, token)
+                info["exists"] = True
+                return info
             # 其他失败（名字被占/无权限/网络）：明确报错，不重试不自动改名
             raise RuntimeError(
                 f"创建仓库 {name!r} 失败：{r.stderr.strip()}\n"
                 f"建议：换名（--repo）或确认你对 {name!r} 有创建权限。"
             )
         owner = get_authenticated_user(token)
-        return _repo_info(owner, name, token)
+        info = _repo_info(owner, name, token)
+        info["exists"] = False
+        return info
 
     token = token or os.environ.get("GITHUB_TOKEN")
     if not token:
@@ -106,14 +113,17 @@ def create_repo(name: str, description: str = "", private: bool = False,
         if "name already exists" in str(e):
             # 属于你的仓库（同名复用），继续
             owner = get_authenticated_user(token)
-            return _repo_info(owner, name, token)
+            info = _repo_info(owner, name, token)
+            info["exists"] = True
+            return info
         # 其他冲突（422 无权限 / 名字被他人占用等）：明确报错，不重试不自动改名
         raise RuntimeError(
             f"创建仓库 {name!r} 失败：{e}\n"
             f"建议：换名（--repo）或确认你对 {name!r} 有创建权限。"
         ) from e
     return {"owner": resp["owner"]["login"], "repo": resp["name"],
-            "clone_url": resp["clone_url"], "html_url": resp["html_url"]}
+            "clone_url": resp["clone_url"], "html_url": resp["html_url"],
+            "exists": False}
 
 
 def _repo_info(owner: str, name: str, token: Optional[str]) -> dict:
@@ -224,7 +234,7 @@ def _ensure_gh_git_credentials(root: Path) -> None:
 
 
 def push(root: Path, clone_url: str, token: Optional[str] = None,
-         branch: Optional[str] = None) -> None:
+         branch: Optional[str] = None, force: bool = False) -> None:
     """把当前提交推送到远程。
 
     安全约束：token 绝不写入 .git/config。
@@ -233,24 +243,42 @@ def push(root: Path, clone_url: str, token: Optional[str] = None,
     - 非 gh 路径：仅把「不含 token 的 plain remote」持久化；推送时用内联
       token URL 且不加 -u，避免 branch.<name>.remote 记录 token。
     推送前先经 `_check_git_credentials` 预检，凭据缺失则早失败并提示。
+
+    force=True 用于「覆盖式更新已存在仓库」：用 `--force-with-lease`（而非裸
+    `--force`）安全覆盖——若远程在本地不知情时被人改过（本地无该提交的引用），
+    推送会被拒绝，避免静默覆盖他人工作。工具单向发布场景（远程即工具生成）
+    用此模式把仓库对齐到「源项目当前状态」。
     """
     root = Path(root)
     branch = branch or current_branch(root)
     _check_git_credentials(root)  # T2：推送前预检凭据通道
+    force_flag = ["--force-with-lease"] if force else []
 
     if detect_gh():
         # gh 走系统凭据，先确保 remote 存在再推送
         r = _run(["git", "-C", str(root), "remote", "get-url", "origin"], check=False)
         if r.returncode != 0:
             _git_check(["git", "-C", str(root), "remote", "add", "origin", clone_url], root, "添加 remote")
+        # 覆盖式推送前刷新 origin/main 远程跟踪分支：--force-with-lease 默认以
+        # refs/remotes/origin/main 为 lease 参考，若该 ref 过期/缺失会被判 stale 而拒绝。
+        # 先 fetch 让 lease 基准 = 真实远程现状，再强推即可安全对齐。
+        if force:
+            _run(["git", "-C", str(root), "fetch", "origin", "main"], check=False)
+            # 显式取出远程 main 当前 commit，作为 lease 期望值，避免依赖
+            # origin/main 远程跟踪分支是否被可靠注册（偶发缺失导致 stale 拒绝）。
+            head = _run(["git", "-C", str(root), "rev-parse", "FETCH_HEAD"], check=False)
+            if head.returncode == 0 and head.stdout.strip():
+                force_flag = [f"--force-with-lease=origin/main:{head.stdout.strip()}"]
         try:
-            _git_check(["git", "-C", str(root), "push", "-u", "origin", branch], root, "推送（gh）")
+            _git_check(["git", "-C", str(root), "push", "-u", "origin", branch,
+                        *force_flag], root, "推送（gh）")
         except RuntimeError as e:
             # T1：gh 路径推送失败，若属「凭据不可用」，兜底配置 gh 凭据助手后重试一次；
             # 重试成功即返回，不再抛出原错误。
             if any(h in str(e).lower() for h in _CREDENTIAL_ERROR_HINTS):
                 _ensure_gh_git_credentials(root)
-                _git_check(["git", "-C", str(root), "push", "-u", "origin", branch], root, "推送（gh 重试）")
+                _git_check(["git", "-C", str(root), "push", "-u", "origin", branch,
+                            *force_flag], root, "推送（gh 重试）")
                 return
             raise  # 非凭据错误（如分支冲突）：直接抛出，不盲目降级
         return
@@ -260,8 +288,14 @@ def push(root: Path, clone_url: str, token: Optional[str] = None,
     # 只持久化「不含 token」的 plain remote，避免凭证落盘
     _git_check(["git", "-C", str(root), "remote", "remove", "origin"], root, "清理旧 remote")
     _git_check(["git", "-C", str(root), "remote", "add", "origin", clone_url], root, "添加 plain remote")
+    # 覆盖式推送前刷新 origin/main，使 --force-with-lease 的 lease 基准为最新远程状态
+    if force:
+        _run(["git", "-C", str(root), "fetch", "origin", "main"], check=False)
+        head = _run(["git", "-C", str(root), "rev-parse", "FETCH_HEAD"], check=False)
+        if head.returncode == 0 and head.stdout.strip():
+            force_flag = [f"--force-with-lease=origin/main:{head.stdout.strip()}"]
     # 用内联 token URL 推送；不加 -u，故 token 不会进入 branch 配置
-    _git_check(["git", "-C", str(root), "push", push_url, branch], root, "推送（token）")
+    _git_check(["git", "-C", str(root), "push", *force_flag, push_url, branch], root, "推送（token）")
     # 把 upstream 指向 plain origin，方便后续无凭证推送/拉取
     _git_check(["git", "-C", str(root), "branch", "--set-upstream-to", f"origin/{branch}"], root, "设置 upstream")
 

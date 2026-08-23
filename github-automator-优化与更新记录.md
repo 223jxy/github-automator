@@ -184,3 +184,38 @@ grep -c "__pycache__\|\*.pyc" .gitignore   # 命中，Python 片段已补全
 | Phase 5 | v1.1.0~v1.2.0 | 46 | 缺陷1/2/3 + 汉转英 + 零交互 |
 | Phase 6 | v1.3.0 | 48 | `git add -A` 隐私隐患修复 |
 | Phase 7 | （修复后重发 netdisk-organizer） | 50 | 临时目录发布 + Release 精确打仓库 |
+| Phase 8 | netdisk-organizer v1.1.0 | 55 | 覆盖式更新（FETCH_HEAD + 显式 lease）+ create_repo exists 标记 |
+
+---
+
+## 十、Phase 8 — 覆盖式更新（更新已存在仓库）（2026-08-23 真机验证）
+
+> 背景：用户已把 netdisk-organizer 作为 v1.0.0 发布，现更新代码后要用工具发布 v1.1.0，「覆盖」旧仓库而非新建。
+
+### 核心改动
+1. **`create_repo` 返回 `exists` 标记**（gh + token 双路径）：同名仓库已存在 → `exists=True`，供 `run()` 权威判定首发布 / 覆盖式，替代原脆弱的「fetch 探测」。
+2. **`run()` 覆盖式分支**：
+   - `repo_info["exists"]` 为 True → 走覆盖式：`git fetch origin main` → `git reset --hard FETCH_HEAD`（对齐远程基线）→ 叠加本次源文件 + 生成内容 → `git add -A` → 有变化才 commit → `push(force=True)`。
+   - `exists=True` 但 fetch 失败 → 显式报错（不再静默走首发布撞 non-fast-forward）。
+3. **`push(force=True)` 修复 lease 过期**：
+   - 先 `git fetch origin main` 刷新；再 `git rev-parse FETCH_HEAD` 取远程 main 当前 commit；显式 `git push --force-with-lease=origin/main:<sha>`。
+   - 既不依赖 `refs/remotes/origin/main` 是否被可靠注册，又保留「远程被不知情改动时拒绝」的安全语义。
+
+### 暴露并修复的缺陷（见缺陷清单 缺陷 7）
+- **缺陷 7a**：原 `git fetch origin +refs/heads/main:refs/remotes/origin/main` 强制 refspec 偶发不注册 `origin/main`，导致 `reset --hard origin/main` 报 `unknown revision` → 改用 `FETCH_HEAD`。
+- **缺陷 7b**：`--force-with-lease` 默认比 `origin/main`，临时目录无该 tracking ref → `stale info` 拒绝 → 改用显式 `--force-with-lease=origin/main:<sha>`。
+
+### 环境踩坑（重要）
+- 本机 `HTTPS_PROXY=http://127.0.0.1:7897/`（系统代理）。**工具发布必须走代理**：直连 GitHub 会被 `Connection was reset` 重置。
+- 运行命令（保留代理、gh 在 PATH）：
+  ```bash
+  export PATH="$PATH:/c/Program Files/GitHub CLI"
+  python -m github_automator.cli "D:/path/to/project" --repo repo-name --version v1.1.0 --force-readme
+  ```
+- 切勿 `unset HTTPS_PROXY`——那会让 `gh`/`git` 直连失败。
+
+### 验证（真机）
+- `netdisk-organizer` v1.0.0 → v1.1.0 覆盖式更新成功。
+- 源项目零污染（无 `.git`/`dist`，文件数仅因用户更新增加）。
+- 远程根目录干净（无 `state/`/`audit/`/`cookie.json`/`qr.png`/`.workbuddy`，源 `.gitignore` 正确排除）。
+- Release v1.1.0 + `netdisk-organizer-v1.1.0.zip` 资产已上传。

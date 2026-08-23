@@ -139,31 +139,76 @@ def run(project: Path, repo: str, version: str, private: bool,
 
         _git(["init"], cwd=stage)
         _git(["checkout", "-b", "main"], cwd=stage, check=False)
-        _git(["add", "-A"], cwd=stage)  # 临时目录只含已过滤的干净文件，安全
-        # 守卫：仅在确有暂存内容时才提交，避免「空 add」触发 git 报错退出
-        diff = _git(["diff", "--cached", "--quiet"], cwd=stage, check=False)
-        if diff.returncode != 0:
-            # check=True：提交失败（如未配置 git 身份）直接抛出，不再静默吞掉
-            _git(["commit", "-m", message], cwd=stage)
-            _log("已提交本地改动（临时发布目录）。")
-        else:
-            _log("无可提交改动，跳过 commit。")
+        # 仅 add（暂不 commit）：源项目新文件已就位，commit 推迟到「首发布/更新」
+        # 分支判定之后，避免重复 commit 或白做。临时目录只含已过滤的干净文件，安全。
 
         # 3) 打 Release zip 快照（生成到临时目录顶层 tmp，而非 stage 内——
         #    保证 zip 不会被 git 跟踪进仓库历史，仅作为 Release asset 上传）
         zip_path = make_release_zip(stage, info, version, tmp, archive_name=repo)
         _log(f"已生成发布快照：{zip_path}")
 
-        # 5) 创建仓库 + 推送
-        # 安全闸门：本地无任何提交时直接失败，避免创建空 GitHub 仓库
-        if not has_commit(stage):
-            raise RuntimeError("本地无提交，无法推送（避免创建空 GitHub 仓库）。"
-                               "请确认 git 身份已配置或项目有可提交内容。")
+        # 5) 创建仓库 + 推送（区分首发布 / 覆盖式更新）
+        # 安全闸门：本地无任何文件可提交时直接失败，避免创建空 GitHub 仓库
+        if not list(stage.rglob("*")):
+            raise RuntimeError("临时发布目录为空，无法推送（避免创建空 GitHub 仓库）。"
+                               "请确认项目有可提交内容。")
         owner = get_authenticated_user(token)
         _log(f"已登录 GitHub 用户：{owner}")
         repo_info = create_repo(repo, info.description, private, token)
         _log(f"仓库已就绪：{repo_info['html_url']}")
-        push(stage, repo_info["clone_url"], token)
+
+        # 区分首发布 / 覆盖式更新。判定依据：create_repo 返回的 exists 标记
+        # （仓库是否在你名下已存在），比「尝试 fetch 远程历史」更可靠。
+        # 覆盖式语义：远程即工具生成，仓库应然状态 = 源项目当前状态；用
+        # --force-with-lease 安全覆盖（远程被不知情改动时会拒绝，不静默覆盖）。
+        repo_exists = repo_info.get("exists", False)
+        _git(["remote", "add", "origin", repo_info["clone_url"]], cwd=stage, check=False)
+        if repo_exists:
+            # 覆盖式更新：先把工作区对齐到远程基线（拉取并 reset），再叠加本次
+            # 源项目文件，避免把远程已有但本地过滤掉的文件残留进仓库。
+            # 用 `git fetch origin main` + `reset --hard FETCH_HEAD`：FETCH_HEAD
+            # 是 fetch 后必定存在的引用，比依赖 origin/main 远程跟踪分支更稳
+            # （后者在强制 refspec 下偶发未被注册，导致 reset 找不到目标）。
+            fetch = _git(["fetch", "origin", "main"], cwd=stage, check=False)
+            if fetch.returncode != 0:
+                raise RuntimeError(
+                    "仓库已存在，但拉取远程 main 分支失败（网络或凭证问题），"
+                    "无法安全执行覆盖式更新。\n"
+                    "建议：检查 gh 登录状态（`gh auth status`）与网络连通性后重试。"
+                )
+            reset = _git(["reset", "--hard", "FETCH_HEAD"], cwd=stage, check=False)
+            if reset.returncode != 0:
+                raise RuntimeError("拉取远程历史后对齐工作区失败，已中止覆盖式更新。")
+            _log("检测到远程已有历史，采用覆盖式更新（对齐远程后叠加本次文件）。")
+            # 重新叠加本次源项目文件 + 生成内容（reset 已把 stage 工作区对齐到远程状态）
+            for p in sorted(project.rglob("*")):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(project)
+                if ".git" in rel.parts or ".workbuddy" in rel.parts or "dist" in rel.parts:
+                    continue
+                if should_include(p, project, gitignore=gitignore):
+                    dest = stage / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(p, dest)
+            if gi_text is not None:
+                (stage / ".gitignore").write_text(gi_text, encoding="utf-8")
+            if readme_text is not None:
+                (stage / "README.md").write_text(readme_text, encoding="utf-8")
+            _git(["add", "-A"], cwd=stage)
+            diff = _git(["diff", "--cached", "--quiet"], cwd=stage, check=False)
+            if diff.returncode != 0:
+                _git(["commit", "-m", message], cwd=stage)
+                _log("已提交更新（覆盖式）。")
+            else:
+                _log("与远程内容一致，无新提交。")
+            push(stage, repo_info["clone_url"], token, force=True)
+        else:
+            # 首发布：直接提交本地新文件并普通推送
+            _git(["add", "-A"], cwd=stage)
+            _git(["commit", "-m", message], cwd=stage)
+            _log("已提交本地改动（临时发布目录）。")
+            push(stage, repo_info["clone_url"], token)
         _log("已推送到 GitHub。")
 
         # 6) 创建 Release（可选）；cwd=stage 确保 gh 作用到目标仓库而非工具自身仓库

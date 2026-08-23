@@ -205,6 +205,70 @@ class TestPush(unittest.TestCase):
             # 关键词确实命中 _CREDENTIAL_ERROR_HINTS
             self.assertTrue(any(h in "could not read username" for h in _CREDENTIAL_ERROR_HINTS))
 
+    def test_push_force_uses_force_with_lease(self):
+        # 覆盖式更新：force=True 必须带 --force-with-lease（安全覆盖，非裸 --force）
+        captured = {}
+        ok = _FakeCompleted(returncode=0)
+        p_gh, p_run = self._patch_gh_run([ok])
+        # 捕获 push 命令
+        real_run = p_run.start()
+        def spy(cmd, cwd=None, check=True):
+            if cmd[:2] == ["git", "-C"] and len(cmd) >= 4 and cmd[3] == "push":
+                captured["cmd"] = cmd
+            return real_run(cmd, cwd=cwd, check=check)
+        p_run.stop()
+        with p_gh, mock.patch("github_automator.github._run", side_effect=spy):
+            push(Path("/tmp/x"), "https://github.com/o/r.git", force=True)
+        # push 命令里应含 --force-with-lease（可能带 =origin/main:<sha> 显式期望值）
+        lease = next((a for a in captured["cmd"] if a.startswith("--force-with-lease")), None)
+        self.assertIsNotNone(lease, "force 推送必须带 --force-with-lease")
+        self.assertNotEqual(lease, "--force", "必须是 lease 模式，不能是裸 --force")
+
+    def test_push_no_force_omits_flag(self):
+        # 首发布：force=False 不应带 --force-with-lease
+        captured = {}
+        ok = _FakeCompleted(returncode=0)
+        p_gh, p_run = self._patch_gh_run([ok])
+        real_run = p_run.start()
+        def spy(cmd, cwd=None, check=True):
+            if cmd[:2] == ["git", "-C"] and len(cmd) >= 4 and cmd[3] == "push":
+                captured["cmd"] = cmd
+            return real_run(cmd, cwd=cwd, check=check)
+        p_run.stop()
+        with p_gh, mock.patch("github_automator.github._run", side_effect=spy):
+            push(Path("/tmp/x"), "https://github.com/o/r.git", force=False)
+        self.assertNotIn("--force-with-lease", captured["cmd"],
+                         "首发布不应带 --force-with-lease")
+
+    def test_push_force_refreshes_origin_main_before_lease(self):
+        # 覆盖式推送：force=True 必须在 --force-with-lease 之前先 fetch origin main
+        # 并 rev-parse FETCH_HEAD（取 lease 期望值），否则 lease 会被判 stale 而拒绝。
+        root = Path("/tmp/x")
+        root_str = str(root)
+        calls = []
+        ok = _FakeCompleted(returncode=0)
+        p_gh, p_run = self._patch_gh_run([ok])
+        real_run = p_run.start()
+        def spy(cmd, cwd=None, check=True):
+            calls.append(list(cmd))
+            return real_run(cmd, cwd=cwd, check=check)
+        p_run.stop()
+        with p_gh, mock.patch("github_automator.github._run", side_effect=spy):
+            push(root, "https://github.com/o/r.git", force=True)
+        fetch_idx = next((i for i, c in enumerate(calls)
+                          if c[:4] == ["git", "-C", root_str, "fetch"]
+                          and c[4:] == ["origin", "main"]), None)
+        rev_idx = next((i for i, c in enumerate(calls)
+                        if c[:4] == ["git", "-C", root_str, "rev-parse"]
+                        and c[4:] == ["FETCH_HEAD"]), None)
+        push_idx = next((i for i, c in enumerate(calls)
+                         if c[:4] == ["git", "-C", root_str, "push"]), None)
+        self.assertIsNotNone(fetch_idx, f"force 推送前必须 fetch origin main，实际调用：{calls}")
+        self.assertIsNotNone(rev_idx, "fetch 后必须 rev-parse FETCH_HEAD 取 lease 期望值")
+        self.assertIsNotNone(push_idx, "必须执行 push")
+        self.assertLess(fetch_idx, rev_idx, "fetch 在 rev-parse 之前")
+        self.assertLess(rev_idx, push_idx, "rev-parse FETCH_HEAD 必须在 push 之前")
+
 
 class _FakePath:
     """模拟 Path，供 asset_path 参数使用。"""
