@@ -185,6 +185,7 @@ grep -c "__pycache__\|\*.pyc" .gitignore   # 命中，Python 片段已补全
 | Phase 6 | v1.3.0 | 48 | `git add -A` 隐私隐患修复 |
 | Phase 7 | （修复后重发 netdisk-organizer） | 50 | 临时目录发布 + Release 精确打仓库 |
 | Phase 8 | netdisk-organizer v1.1.0 | 55 | 覆盖式更新（FETCH_HEAD + 显式 lease）+ create_repo exists 标记 |
+| Phase 8 自举 | github-automator v1.4.0 | 55 | 用工具自举重发自身，使 Phase 8 发布逻辑闭环（此前远程 Release 停留在 v1.3.0） |
 
 ---
 
@@ -219,3 +220,31 @@ grep -c "__pycache__\|\*.pyc" .gitignore   # 命中，Python 片段已补全
 - 源项目零污染（无 `.git`/`dist`，文件数仅因用户更新增加）。
 - 远程根目录干净（无 `state/`/`audit/`/`cookie.json`/`qr.png`/`.workbuddy`，源 `.gitignore` 正确排除）。
 - Release v1.1.0 + `netdisk-organizer-v1.1.0.zip` 资产已上传。
+
+---
+
+## 十一、自举重发 v1.4.0（github-automator 自身，2026-08-24）
+
+> 背景：Phase 8 改写了覆盖式发布 + lease stale 修复逻辑（`create_repo` 返回 `exists` 标记、`push(force=True)` 显式 lease、`run()` 覆盖式 FETCH_HEAD 对齐）。截至本次前，远程 `github-automator` 最新 Release 停留在 **v1.3.0**（仅含 Phase 6 文档校准），而本地 main 已推进到 `6a453b4`（含 Phase 7/8）。为恢复「工具改了发布逻辑→用工具自举验证→重发 Release」的闭环，执行本次自举。
+
+### 改动前状态对齐
+- 远程 `main` = `6a453b4`，与本地一致 ✅（无落后）。
+- 远程 `v1.3.0` tag 指向 `20f1a97`（Phase 6 文档校准 commit，是本地 main 的祖先），作为历史快照保留，不强行对齐 main 顶端。
+- 文档校准：README / 《优化分析》测试数声明 31 → **55**（与项目介绍、真实 `unittest discover` 结果一致）。
+
+### 执行（保留代理 + gh 在 PATH）
+```bash
+export PATH="$PATH:/c/Program Files/GitHub CLI"
+python -m github_automator.cli . --repo github-automator --version v1.4.0
+```
+
+### 验证（真机）
+- 仓库 `223jxy/github-automator` 已存在 → 走覆盖式分支（`exists=True`），未新建仓库。
+- commit + push 成功，远程 `main` = `6a453b4`（覆盖式仅叠加增量，基线未变）。
+- tag `v1.4.0` + Release 创建，资产 `github-automator-v1.4.0.zip` 已上传。
+- 远程根目录干净（无 `.workbuddy`/`dist`/`state`），源码 zip 顶层目录 = `github-automator/`。
+- `python -m unittest discover -s tests` → **Ran 55 tests ... OK**。
+
+### 结论
+- 自举闭环恢复：发布逻辑（Phase 8）与已发布版本（v1.4.0）一致。
+- 远程 Release 时间线：v1.0.0 → v1.1.0 → v1.2.0 → v1.3.0（文档快照）→ v1.4.0（含 Phase 7/8 发布引擎）。
