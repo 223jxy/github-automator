@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -265,5 +266,52 @@ def main(argv: list[str] | None = None) -> int:
     )
 
 
+def _write_diagnostic(exc: BaseException, argv: list[str]) -> Path:
+    """未捕获异常时写结构化诊断日志到用户缓存目录，便于带回修复工具。
+
+    位置：~/.cache/github-automator/error-<UTC时间戳>.log
+    内容：时间/版本/Python/平台/cwd/argv/错误类型/完整 traceback
+    脱敏：home 路径替换为 <USER_HOME>，避免日志泄露用户名。
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    cache_dir = Path.home() / ".cache" / "github-automator"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    log_path = cache_dir / f"error-{ts}.log"
+    home = str(Path.home())
+    username = Path.home().name
+
+    def _redact(text: str) -> str:
+        # 先替换整段 home 路径（反斜杠），再替换散落的用户名（覆盖正斜杠等变体），避免个人目录泄露。
+        return text.replace(home, "<USER_HOME>").replace(username, "<USER>")
+
+    tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    tb_redacted = [_redact(ln) for ln in tb]
+    cwd_redacted = _redact(str(Path.cwd()))
+    argv_redacted = [_redact(a) for a in argv]
+    content = "\n".join([
+        "github-automator 诊断日志",
+        f"时间(UTC): {ts}",
+        f"工具版本: {VERSION}",
+        f"Python: {sys.version.split()[0]}",
+        f"平台: {sys.platform}",
+        f"cwd: {cwd_redacted}",
+        f"argv: {' '.join(argv_redacted)}",
+        f"错误类型: {type(exc).__name__}",
+        f"错误信息: {exc}",
+        "--- traceback ---",
+        *tb_redacted,
+    ])
+    log_path.write_text(content, encoding="utf-8")
+    return log_path
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # 顶层兜底：确保任何报错都可被携带回来修复工具
+        log_path = _write_diagnostic(exc, sys.argv)
+        _log(f"运行出错，诊断日志已写入：{log_path}")
+        _log("将该文件内容发回维护者即可定位修复（日志已对 home 路径脱敏）。")
+        sys.exit(1)
